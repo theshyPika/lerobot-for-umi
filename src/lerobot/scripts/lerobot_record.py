@@ -117,6 +117,7 @@ from lerobot.robots import (  # noqa: F401
     reachy2,
     so_follower,
     unitree_g1 as unitree_g1_robot,
+    g2
 )
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
@@ -132,6 +133,7 @@ from lerobot.teleoperators import (  # noqa: F401
     reachy2_teleoperator,
     so_leader,
     unitree_g1,
+    pico
 )
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
 from lerobot.utils.constants import ACTION, OBS_STR
@@ -571,10 +573,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             if cfg.interpolation_multiplier > 1:
                 interpolator = ActionInterpolator(multiplier=cfg.interpolation_multiplier)
                 logging.info(f"Action interpolation enabled: {cfg.interpolation_multiplier}x control rate")
-
-        robot.connect()
         if teleop is not None:
-            teleop.connect()
+            teleop.connect()        
+        robot.connect()
+        
 
         listener, events = init_keyboard_listener()
 

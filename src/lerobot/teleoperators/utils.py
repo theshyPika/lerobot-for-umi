@@ -99,6 +99,10 @@ def make_teleoperator_from_config(config: TeleoperatorConfig) -> "Teleoperator":
         from .openarm_mini import OpenArmMini
 
         return OpenArmMini(config)
+    elif config.type == "pico":
+        from .pico import PicoTeleoperator
+
+        return PicoTeleoperator(config)
     else:
         try:
             return cast("Teleoperator", make_device_from_device_class(config))
