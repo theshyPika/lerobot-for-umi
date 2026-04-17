@@ -34,15 +34,15 @@ class PI05Config(PreTrainedConfig):
     dtype: str = "float32"  # Options: "bfloat16", "float32"
 
     n_obs_steps: int = 1
-    chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
-    n_action_steps: int = 50  # Number of action steps to execute
+    chunk_size: int = 2  # Number of action steps to predict, in openpi called "action_horizon"
+    n_action_steps: int = 2  # Number of action steps to execute
 
     # Shorter state and action vectors will be padded to these dimensions
     max_state_dim: int = 32
     max_action_dim: int = 32
 
     # Flow matching parameters: see openpi `PI0Pytorch`
-    num_inference_steps: int = 10
+    num_inference_steps: int = 4
     time_sampling_beta_alpha: float = 1.5
     time_sampling_beta_beta: float = 1.0
     time_sampling_scale: float = 0.999
@@ -51,7 +51,7 @@ class PI05Config(PreTrainedConfig):
     max_period: float = 4.0
 
     # Relative actions: converts absolute actions to relative (relative to state).
-    use_relative_actions: bool = False
+    use_relative_actions: bool = True
     # Joint names to exclude from relative (kept absolute). Empty list = all dims relative.
     relative_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
     # Populated at runtime from dataset metadata by make_policy.

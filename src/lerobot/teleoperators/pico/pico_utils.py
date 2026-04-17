@@ -18,7 +18,7 @@ class InputController:
     参考 PICO 官方示例的设计理念，提供更稳定的增量计算。
     """
 
-    def __init__(self, deadzone=0.1, scale_factor=0.6):
+    def __init__(self, deadzone=0.1, scale_factor=1.0):
         """
         Initialize the controller.
 
@@ -96,7 +96,7 @@ class PicoController(InputController):
     - 当抓握键释放时，重置初始姿态
     """
 
-    def __init__(self, deadzone=0.1, scale_factor=0.6, use_coordinate_transform=True):
+    def __init__(self, deadzone=0.1, scale_factor=1.0, use_coordinate_transform=True):
         """
         Initialize PICO controller.
         
@@ -165,6 +165,7 @@ class PicoController(InputController):
             logging.info("PICO XR controller initialized successfully")
             
             print("PICO XR Controller controls for dual-arm teleoperation:")
+            print(f" Scale factor: {self.scale_factor}")
             print("  Left grip: Control left arm (when pressed)")
             print("  Right grip: Control right arm (when pressed)")
             print("  Left trigger: Control left gripper (continuous)")
@@ -261,7 +262,7 @@ class PicoController(InputController):
 
     def _process_pose(self, pose: Optional[List[float]]) -> Tuple[np.ndarray, np.ndarray]:
         """
-        处理控制器姿态，应用坐标系转换和缩放因子。
+        处理控制器姿态，应用坐标系转换。
         
         严格按照官方示例 dual_arm_ur_controller.py 的 _process_xr_pose 方法实现。
         使用 meshcat.transformations 库，与官方示例完全一致。

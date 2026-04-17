@@ -14,12 +14,12 @@ DOF_PER_ARM = 6  # 3 position + 3 axis-angle rotation
 GRIPPER_PER_ARM = 1
 
 # Action feature names
-LEFT_POSITION_NAMES = ["left_delta_x", "left_delta_y", "left_delta_z"]
-RIGHT_POSITION_NAMES = ["right_delta_x", "right_delta_y", "right_delta_z"]
-LEFT_ROTATION_NAMES = ["left_delta_rot_x", "left_delta_rot_y", "left_delta_rot_z"]
-RIGHT_ROTATION_NAMES = ["right_delta_rot_x", "right_delta_rot_y", "right_delta_rot_z"]
-LEFT_GRIPPER_NAME = "left_gripper"
-RIGHT_GRIPPER_NAME = "right_gripper"
+LEFT_POSITION_NAMES = ["l.ee.x", "l.ee.y", "l.ee.z"]
+RIGHT_POSITION_NAMES = ["r.ee.x", "r.ee.y", "r.ee.z"]
+LEFT_ROTATION_NAMES = ["l.ee.wx", "l.ee.wy", "l.ee.wz"]
+RIGHT_ROTATION_NAMES = ["r.ee.wx", "r.ee.wy", "r.ee.wz"]
+LEFT_GRIPPER_NAME = "l.ee.gripper.pos"
+RIGHT_GRIPPER_NAME = "r.ee.gripper.pos"
 
 
 class PicoTeleoperator(Teleoperator):
@@ -99,17 +99,17 @@ class PicoTeleoperator(Teleoperator):
         
         # Position
         for i, axis in enumerate(["x", "y", "z"]):
-            names[f"{prefix}delta_{axis}"] = idx
+            names[f"{prefix}.ee.{axis}"] = idx
             idx += 1
         
         # Rotation (axis-angle)
-        for i, axis in enumerate(["rot_x", "rot_y", "rot_z"]):
-            names[f"{prefix}delta_{axis}"] = idx
+        for i, axis in enumerate(["wx", "wy", "wz"]):
+            names[f"{prefix}.ee.{axis}"] = idx
             idx += 1
         
         # Gripper
         if self.config.use_gripper:
-            names[f"{prefix}gripper"] = idx
+            names[f"{prefix}.ee.gripper.pos"] = idx
             idx += 1
         
         shape = (idx,)
@@ -167,25 +167,25 @@ class PicoTeleoperator(Teleoperator):
         
         # 构建动作字典
         action_dict = {
-            "left_delta_x": left_delta_x,
-            "left_delta_y": left_delta_y,
-            "left_delta_z": left_delta_z,
-            "left_delta_rot_x": left_delta_rot_x,
-            "left_delta_rot_y": left_delta_rot_y,
-            "left_delta_rot_z": left_delta_rot_z,
-            "right_delta_x": right_delta_x,
-            "right_delta_y": right_delta_y,
-            "right_delta_z": right_delta_z,
-            "right_delta_rot_x": right_delta_rot_x,
-            "right_delta_rot_y": right_delta_rot_y,
-            "right_delta_rot_z": right_delta_rot_z,
+            "l.ee.x": left_delta_x,
+            "l.ee.y": left_delta_y,
+            "l.ee.z": left_delta_z,
+            "l.ee.wx": left_delta_rot_x,
+            "l.ee.wy": left_delta_rot_y,
+            "l.ee.wz": left_delta_rot_z,
+            "r.ee.x": right_delta_x,
+            "r.ee.y": right_delta_y,
+            "r.ee.z": right_delta_z,
+            "r.ee.wx": right_delta_rot_x,
+            "r.ee.wy": right_delta_rot_y,
+            "r.ee.wz": right_delta_rot_z,
         }
         
         # 添加夹爪控制
         if self.config.use_gripper:
             left_gripper_value, right_gripper_value = self.pico.get_gripper_values()
-            action_dict["left_gripper"] = left_gripper_value
-            action_dict["right_gripper"] = right_gripper_value
+            action_dict["l.ee.gripper.pos"] = left_gripper_value
+            action_dict["r.ee.gripper.pos"] = right_gripper_value
         
         return action_dict
     
@@ -218,26 +218,26 @@ class PicoTeleoperator(Teleoperator):
         # 如果抓握键未激活，返回零动作
         if not grip_active:
             action_dict = {
-                f"{prefix}delta_x": 0.0,
-                f"{prefix}delta_y": 0.0,
-                f"{prefix}delta_z": 0.0,
-                f"{prefix}delta_rot_x": 0.0,
-                f"{prefix}delta_rot_y": 0.0,
-                f"{prefix}delta_rot_z": 0.0,
+                f"{prefix}.ee.x": 0.0,
+                f"{prefix}.ee.y": 0.0,
+                f"{prefix}.ee.z": 0.0,
+                f"{prefix}.ee.wx": 0.0,
+                f"{prefix}.ee.wy": 0.0,
+                f"{prefix}.ee.wz": 0.0,
             }
         else:
             action_dict = {
-                f"{prefix}delta_x": delta_x,
-                f"{prefix}delta_y": delta_y,
-                f"{prefix}delta_z": delta_z,
-                f"{prefix}delta_rot_x": delta_rot_x,
-                f"{prefix}delta_rot_y": delta_rot_y,
-                f"{prefix}delta_rot_z": delta_rot_z,
+                f"{prefix}.ee.x": delta_x,
+                f"{prefix}.ee.y": delta_y,
+                f"{prefix}.ee.z": delta_z,
+                f"{prefix}.ee.wx": delta_rot_x,
+                f"{prefix}.ee.wy": delta_rot_y,
+                f"{prefix}.ee.wz": delta_rot_z,
             }
         
         # 添加夹爪控制
         if self.config.use_gripper:
-            action_dict[f"{prefix}gripper"] = gripper_value
+            action_dict[f"{prefix}.ee.gripper.pos"] = gripper_value
         
         return action_dict
 
@@ -245,35 +245,35 @@ class PicoTeleoperator(Teleoperator):
         """Return zero action when controller is not connected."""
         if self.config.dual_arm:
             zero_action = {
-                "left_delta_x": 0.0,
-                "left_delta_y": 0.0,
-                "left_delta_z": 0.0,
-                "left_delta_rot_x": 0.0,
-                "left_delta_rot_y": 0.0,
-                "left_delta_rot_z": 0.0,
-                "right_delta_x": 0.0,
-                "right_delta_y": 0.0,
-                "right_delta_z": 0.0,
-                "right_delta_rot_x": 0.0,
-                "right_delta_rot_y": 0.0,
-                "right_delta_rot_z": 0.0,
+                "l.ee.x": 0.0,
+                "l.ee.y": 0.0,
+                "l.ee.z": 0.0,
+                "l.ee.wx": 0.0,
+                "l.ee.wy": 0.0,
+                "l.ee.wz": 0.0,
+                "r.ee.x": 0.0,
+                "r.ee.y": 0.0,
+                "r.ee.z": 0.0,
+                "r.ee.wx": 0.0,
+                "r.ee.wy": 0.0,
+                "r.ee.wz": 0.0,
             }
             if self.config.use_gripper:
-                zero_action["left_gripper"] = 0.0  # 0.0 = 打开
-                zero_action["right_gripper"] = 0.0
+                zero_action["l.ee.gripper.pos"] = 0.0  # 0.0 = 打开
+                zero_action["r.ee.gripper.pos"] = 0.0
             return zero_action
         else:
-            prefix = "left_" if self.config.use_left_arm else "right_"
+            prefix = "l" if self.config.use_left_arm else "r"
             zero_action = {
-                f"{prefix}delta_x": 0.0,
-                f"{prefix}delta_y": 0.0,
-                f"{prefix}delta_z": 0.0,
-                f"{prefix}delta_rot_x": 0.0,
-                f"{prefix}delta_rot_y": 0.0,
-                f"{prefix}delta_rot_z": 0.0,
+                f"{prefix}.ee.x": 0.0,
+                f"{prefix}.ee.y": 0.0,
+                f"{prefix}.ee.z": 0.0,
+                f"{prefix}.ee.wx": 0.0,
+                f"{prefix}.ee.wy": 0.0,
+                f"{prefix}.ee.wz": 0.0,
             }
             if self.config.use_gripper:
-                zero_action[f"{prefix}gripper"] = 0.0  # 0.0 = 打开
+                zero_action[f"{prefix}.ee.gripper.pos"] = 0.0  # 0.0 = 打开
             return zero_action
 
     def get_teleop_events(self) -> dict[str, Any]:
@@ -331,21 +331,17 @@ class PicoTeleoperator(Teleoperator):
 
     def calibrate(self) -> None:
         """Calibrate the PICO controller."""
-        # No calibration needed for PICO controller
         pass
 
     @property
     def is_calibrated(self) -> bool:
         """Check if PICO controller is calibrated."""
-        # PICO controller doesn't require calibration
         return True
 
     def configure(self) -> None:
         """Configure the PICO controller."""
-        # No additional configuration needed
         pass
 
     def send_feedback(self, feedback: dict) -> None:
         """Send feedback to the PICO controller."""
-        # PICO controller doesn't support feedback
         pass

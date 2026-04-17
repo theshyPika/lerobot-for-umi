@@ -107,6 +107,7 @@ def predict_action(
         observation = prepare_observation_for_inference(observation, device, task, robot_type)
         observation = preprocessor(observation)
 
+        logging.debug(f"observation in predict_action:{observation}")
         # Compute the next action with the policy
         # based on the current observation
         action = policy.select_action(observation)
@@ -120,14 +121,14 @@ def init_keyboard_listener():
     """
     Initializes a non-blocking keyboard listener for real-time user interaction.
 
-    This function sets up a listener for specific keys (right arrow, left arrow, escape) to control
-    the program flow during execution, such as stopping recording or exiting loops. It gracefully
-    handles headless environments where keyboard listening is not possible.
+    This function sets up a listener for specific keys (right arrow, left arrow, escape, 'n') to control
+    the program flow during execution, such as stopping recording, exiting loops, or stepping through
+    policy execution. It gracefully handles headless environments where keyboard listening is not possible.
 
     Returns:
         A tuple containing:
         - The `pynput.keyboard.Listener` instance, or `None` if in a headless environment.
-        - A dictionary of event flags (e.g., `exit_early`) that are set by key presses.
+        - A dictionary of event flags (e.g., `exit_early`, `step_policy`) that are set by key presses.
     """
     # Allow to exit early while recording an episode or resetting the environment,
     # by tapping the right arrow key '->'. This might require a sudo permission
@@ -136,6 +137,7 @@ def init_keyboard_listener():
     events["exit_early"] = False
     events["rerecord_episode"] = False
     events["stop_recording"] = False
+    events["step_policy"] = False  # New event for stepping through policy execution
 
     if is_headless():
         logging.warning(
@@ -160,6 +162,9 @@ def init_keyboard_listener():
                 print("Escape key pressed. Stopping data recording...")
                 events["stop_recording"] = True
                 events["exit_early"] = True
+            elif hasattr(key, 'char') and key.char == 'n':
+                print("'n' key pressed. Stepping to next policy action...")
+                events["step_policy"] = True
         except Exception as e:
             print(f"Error handling key press: {e}")
 

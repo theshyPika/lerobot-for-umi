@@ -72,4 +72,4 @@ class PicoTeleoperatorConfig(TeleoperatorConfig):
     @property
     def single_arm_prefix(self) -> str:
         """Get the prefix for single arm mode based on configuration."""
-        return "left_" if self.use_left_arm else "right_"
+        return "l" if self.use_left_arm else "r"
