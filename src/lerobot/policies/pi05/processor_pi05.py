@@ -55,6 +55,7 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
 
     max_state_dim: int = 32
     task_key: str = "task"
+    subtask_key: str = "subtask"
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         transition = transition.copy()
@@ -62,9 +63,11 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         state = transition.get(TransitionKey.OBSERVATION, {}).get(OBS_STATE)
         if state is None:
             raise ValueError("State is required for PI05")
-        tasks = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}).get(self.task_key)
+        complementary_data = transition.get(TransitionKey.COMPLEMENTARY_DATA, {})
+        tasks = complementary_data.get(self.task_key)
         if tasks is None:
             raise ValueError("No task found in complementary data")
+        subtasks = complementary_data.get(self.subtask_key)
 
         # TODO: check if this necessary
         state = deepcopy(state)
@@ -77,8 +80,20 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         full_prompts = []
         for i, task in enumerate(tasks):
             cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
+            cleaned_subtask = None
+            if subtasks is not None:
+                subtask = subtasks[i] if isinstance(subtasks, list) else subtasks
+                if isinstance(subtask, str):
+                    stripped_subtask = subtask.strip().replace("_", " ").replace("\n", " ")
+                    if stripped_subtask:
+                        cleaned_subtask = stripped_subtask
             state_str = " ".join(map(str, discretized_states[i]))
-            full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
+            if cleaned_subtask is not None:
+                full_prompt = (
+                    f"Task: {cleaned_text}, Subtask: {cleaned_subtask}, State: {state_str};\nAction: "
+                )
+            else:
+                full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
             full_prompts.append(full_prompt)
 
         transition[TransitionKey.COMPLEMENTARY_DATA][self.task_key] = full_prompts
