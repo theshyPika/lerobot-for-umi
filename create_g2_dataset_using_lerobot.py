@@ -138,6 +138,7 @@ from lerobot.datasets.video_utils import (
 
 
 FPS = 30
+G2_GRIPPER_RAW_MAX = 120.0
 CAMERA_SPECS = {
     "hand_left_color": (1056, 1280, 3),
     "hand_right_color": (1056, 1280, 3),
@@ -395,15 +396,22 @@ def get_first_present(row: pd.Series, keys: list[str], field_name: str, required
     return None
 
 
-def extract_gripper_pair(row: pd.Series, prefix: str) -> np.ndarray:
+def extract_gripper_pair(row: pd.Series, prefix: str, *, raw_scale: float | None = None) -> np.ndarray:
     raw = get_first_present(row, [f"{prefix}.effector.position"], f"{prefix} gripper pair")
-    return ensure_float32_vector(raw, 2, f"{prefix}.effector.position")
+    grippers = ensure_float32_vector(raw, 2, f"{prefix}.effector.position")
+    if raw_scale is not None:
+        grippers = grippers / raw_scale
+    return np.clip(grippers, 0.0, 1.0).astype(np.float32)
 
 
 def extract_joint_vector(row: pd.Series, prefix: str) -> np.ndarray:
     raw = get_first_present(row, [f"{prefix}.joint.position"], f"{prefix} dual-arm joint positions")
     joints = ensure_float32_vector(raw, 14, f"{prefix}.joint.position")
-    grippers = extract_gripper_pair(row, prefix)
+    grippers = extract_gripper_pair(
+        row,
+        prefix,
+        raw_scale=G2_GRIPPER_RAW_MAX if prefix == "observation.state" else None,
+    )
     return np.concatenate([joints[:7], grippers[:1], joints[7:14], grippers[1:2]]).astype(np.float32)
 
 
@@ -430,7 +438,11 @@ def vector_to_dual_rotvec(vec: np.ndarray, field_name: str) -> np.ndarray:
 def extract_ee_vector(row: pd.Series, prefix: str) -> np.ndarray:
     raw = get_first_present(row, [f"{prefix}.end.position"], f"{prefix} dual-arm EE pose")
     ee_vec = vector_to_dual_rotvec(np.asarray(raw), f"{prefix}.end.position")
-    grippers = extract_gripper_pair(row, prefix)
+    grippers = extract_gripper_pair(
+        row,
+        prefix,
+        raw_scale=G2_GRIPPER_RAW_MAX if prefix == "observation.state" else None,
+    )
     return np.concatenate([ee_vec[:6], grippers[:1], ee_vec[6:12], grippers[1:2]]).astype(np.float32)
 
 

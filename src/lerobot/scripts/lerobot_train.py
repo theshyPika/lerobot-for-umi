@@ -270,6 +270,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if (processor_pretrained_path and not cfg.resume) or not processor_pretrained_path:
         # Only provide dataset_stats when not resuming from saved processor state
         processor_kwargs["dataset_stats"] = dataset.meta.stats
+        processor_kwargs["rename_map"] = cfg.rename_map
 
     # For SARM, always provide dataset_meta for progress normalization
     if cfg.policy.type == "sarm":
