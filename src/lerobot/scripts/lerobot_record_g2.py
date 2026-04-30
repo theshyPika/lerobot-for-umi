@@ -91,7 +91,7 @@ from lerobot.datasets.image_writer import safe_stop_image_writer
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
 from lerobot.datasets.video_utils import VideoEncodingManager
-from lerobot.model.kinematics import RobotKinematics
+from lerobot.model.kinematics import DualArmKinematics
 # from lerobot.model.kinematics_new import RobotKinematics
 # from lerobot.model.kinematics_backup_05 import RobotKinematics
 from lerobot.policies.factory import make_policy, make_pre_post_processors
@@ -129,7 +129,7 @@ from lerobot.robots import (  # noqa: F401
 )
 from lerobot.robots.g2.g2_constants import LEFT_ARM_JOINT_NAMES, RIGHT_ARM_JOINT_NAMES
 # from lerobot.robots.g2.robot_kinematic_processor import InverseKinematicsEEToJoints
-from lerobot.robots.g2.robot_delta_kinematic_processor import InverseKinematicsDeltaEEToJoints
+from lerobot.robots.g2.robot_kinematic_processor import InverseKinematicsEEToJoints
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
@@ -176,7 +176,7 @@ class DatasetRecordConfig:
     # Limit the frames per second.
     fps: int = 30
     # Number of seconds for data recording for each episode.
-    episode_time_s: int | float = 60
+    episode_time_s: int | float = 90
     # Number of seconds for resetting the environment after each episode.
     reset_time_s: int | float = 60
     # Number of episodes to record.
@@ -217,7 +217,7 @@ class DatasetRecordConfig:
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
     # Path to custom statistics JSON file for normalization #fixed by ck
-    stats_path: str | None = None
+    # stats_path: str | None = None
 
     def __post_init__(self):
         if self.single_task is None:
@@ -539,25 +539,24 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
     teleop_action_processor, _, robot_observation_processor = make_default_processors()
 
-    # left_kinematics_solver = RobotKinematics(
-    #     urdf_path="src/lerobot/robots/g2/G2/genie_robot/urdf/G2_t2_crs/model.urdf",
-    #     target_frame_name="arm_l_link7",
-    #     joint_names=LEFT_ARM_JOINT_NAMES,
-    # )
-    right_kinematics_solver = RobotKinematics(
-        urdf_path="src/lerobot/robots/g2/G2/genie_robot/urdf/G2_t2_crs/model.urdf",
-        # target_frame_name="arm_r_link7",
-        target_frame_name="arm_r_end_link",
-        joint_names=RIGHT_ARM_JOINT_NAMES,
-    )
-    
+    g2_urdf_path = "src/lerobot/robots/g2/G2/genie_robot/urdf/G2_t2_crs/model.urdf"
+    kinematics_solver = None
+    if cfg.robot.use_left_arm or cfg.robot.use_right_arm:
+        kinematics_solver = DualArmKinematics(
+            urdf_path=g2_urdf_path,
+            left_frame_name="arm_l_end_link" if cfg.robot.use_left_arm else None,
+            left_joint_names=LEFT_ARM_JOINT_NAMES if cfg.robot.use_left_arm else None,
+            right_frame_name="arm_r_end_link" if cfg.robot.use_right_arm else None,
+            right_joint_names=RIGHT_ARM_JOINT_NAMES if cfg.robot.use_right_arm else None,
+        )
+
     robot_ee_to_joints_processor = RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction](
         steps=[
-            InverseKinematicsDeltaEEToJoints(
+            InverseKinematicsEEToJoints(
                 motor_names=list(robot.motors),
-                # left_kinematics=left_kinematics_solver,
-                right_kinematics=right_kinematics_solver,
+                kinematics=kinematics_solver,
                 initial_guess_current_joints=True,
+                use_relative_actions=False # TODO： refactor after due to the always absolute action output by prediction actions. @ck
             ),
         ],
         to_transition=robot_action_observation_to_transition,
@@ -631,21 +630,21 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         interpolator = None
         if cfg.policy is not None:
             # Load custom statistics if provided
-            custom_stats = None
-            if cfg.dataset.stats_path:
-                import json
-                with open(cfg.dataset.stats_path, 'r') as f:
-                    custom_stats = json.load(f)
-                logging.info(f"Loaded custom statistics from {cfg.dataset.stats_path}")
+            # custom_stats = None
+            # if cfg.dataset.stats_path:
+            #     import json
+            #     with open(cfg.dataset.stats_path, 'r') as f:
+            #         custom_stats = json.load(f)
+            #     logging.info(f"Loaded custom statistics from {cfg.dataset.stats_path}")
             
             # Prepare postprocessor overrides with custom statistics if available
             postprocessor_overrides = {}
             preprocessor_overrides = {}
-            if custom_stats:
-                # Apply rename_map to custom_stats so that normalizer_processor uses the renamed keys
-                renamed_custom_stats = rename_stats(custom_stats, cfg.dataset.rename_map)
-                preprocessor_overrides["normalizer_processor"]={"stats": renamed_custom_stats}
-                postprocessor_overrides["unnormalizer_processor"] = {"stats": renamed_custom_stats}
+            # if custom_stats:
+            #     # Apply rename_map to custom_stats so that normalizer_processor uses the renamed keys
+            #     renamed_custom_stats = rename_stats(custom_stats, cfg.dataset.rename_map)
+            #     preprocessor_overrides["normalizer_processor"]={"stats": renamed_custom_stats}
+            #     postprocessor_overrides["unnormalizer_processor"] = {"stats": renamed_custom_stats}
             
             # Update preprocessor overrides with device and rename processors
             preprocessor_overrides.update({

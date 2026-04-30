@@ -17,6 +17,7 @@ from ..robot import Robot
 from .config_g2 import G2RobotConfig
 from .config_gripper import DHGripper
 from .g2_constants import (
+    FULL_JOINT_POSITIONS_OBS_KEY,
     GRIPPER_COMMAND_MIN_DELTA,
     LEFT_ARM_JOINT_NAMES,
     RAD_TO_DEG,
@@ -68,8 +69,7 @@ class G2Robot(Robot):
                 'hand_left': 'hand_left',  
                 'hand_right': 'hand_right',  
             }
-            _motors = {f"{p}.joint{i}": None for i in range(1, 8) for p in ("l", "r")}
-            _motors.update({f"{p}.gripper": None for p in ("l", "r")})
+            _motors = [f"l.joint{i}" for i in range(1, 8)] + ["l.gripper"] + [f"r.joint{i}" for i in range(1, 8)] + ["r.gripper"]
         else:
             # 单臂模式：只使用对应的摄像头
             if config.use_left_arm:
@@ -78,16 +78,14 @@ class G2Robot(Robot):
                     'head_color': 'head_color',
                     'hand_left': 'hand_left',  
                 }
-                _motors= {f"l.joint{i}": None for i in range(1,8)}
-                _motors.update({"l.gripper": None})
+                _motors = [f"l.joint{i}" for i in range(1, 8)] + ["l.gripper"]
             else:
                 # 右臂模式：使用 head_color 和 hand_right
                 self.selected_cameras = {
                     'head_color': 'head_color',
                     'hand_right': 'hand_right',  
                 }
-                _motors= {f"r.joint{i}": None for i in range(1,8)}
-                _motors.update({"r.gripper": None})
+                _motors = [f"r.joint{i}" for i in range(1, 8)] + ["r.gripper"]
         self.motors = _motors
 
         self.camera_dimensions = {}
@@ -142,7 +140,7 @@ class G2Robot(Robot):
                 "l.ee.wx",
                 "l.ee.wy",
                 "l.ee.wz",
-                "l.ee.gripper.pos"
+                "l.ee.gripper.pos",
                 "r.ee.x",
                 "r.ee.y",
                 "r.ee.z",
@@ -201,15 +199,19 @@ class G2Robot(Robot):
                 "l.ee.wx",
                 "l.ee.wy",
                 "l.ee.wz",
+            ]
+            if self.config.use_gripper:
+                names.append("l.ee.gripper.pos")
+            names.extend([
                 "r.ee.x",
                 "r.ee.y",
                 "r.ee.z",
                 "r.ee.wx",
                 "r.ee.wy",
                 "r.ee.wz",
-            ]
+            ])
             if self.config.use_gripper:
-                names.extend(["l.ee.gripper.pos", "r.ee.gripper.pos"])
+                names.append("r.ee.gripper.pos")
             return names
         prefix = self.config.single_arm_prefix
         names = [
@@ -532,6 +534,10 @@ class G2Robot(Robot):
             joint_positions_by_name: dict[str, float] = {}
             for state in joints_states["states"]:
                 joint_positions_by_name[state["name"]] = state["motor_position"]
+            obs[FULL_JOINT_POSITIONS_OBS_KEY] = {
+                name: float(np.rad2deg(position))
+                for name, position in joint_positions_by_name.items()
+            }
 
             left_rad = [
                 float(joint_positions_by_name.get(n, 0.0)) for n in LEFT_ARM_JOINT_NAMES
@@ -544,13 +550,10 @@ class G2Robot(Robot):
 
             if self.config.dual_arm:
                 joint_values_deg = list(left_deg) + [0.0] + list(right_deg) + [0.0]
-                # joints_rad = left_rad + [0.0] + right_rad + [0.0]
             elif self.config.use_left_arm:
                 joint_values_deg = list(left_deg) + [0.0]
-                # joints_rad = left_rad + [0.0]
             else:
                 joint_values_deg = list(right_deg) + [0.0]
-                # joints_rad = right_rad + [0.0]
 
             gripper_config = self.config.gripper_config
             if self.config.dual_arm:
@@ -591,7 +594,8 @@ class G2Robot(Robot):
                                 )
                     except Exception as e:
                         logger.warning("获取%s臂夹爪位置失败: %s", arm_side, e)
-            logger.info(f"joint_values_deg' len: {len(joint_values_deg)}")
+            # logger.info(f"joint_values_deg' len: {len(joint_values_deg)}")
+            logger.info(f"joint keys : {joint_keys}")
             for k, v in zip(joint_keys, joint_values_deg, strict=True):
                 obs[k] = float(v)
                 # 更新当前关节角度存储
@@ -600,11 +604,15 @@ class G2Robot(Robot):
 
         except Exception as e:
             logger.warning("获取关节状态失败: %s", e)
+            obs[FULL_JOINT_POSITIONS_OBS_KEY] = {}
             for k in joint_keys:
                 obs[k] = 0.0
 
         try:
+            t_ee_start = time.perf_counter()
             current_poses = self.get_end_effector_pose()
+            t_ee_end = time.perf_counter()
+            logger.info(f"get_end_effector_pose took {(t_ee_end - t_ee_start) * 1000:.2f} ms")
             if self.config.dual_arm:
                 if len(current_poses) >= 2:
                     lp, rp = current_poses[0], current_poses[1]
@@ -696,25 +704,38 @@ class G2Robot(Robot):
         Includes activation check for joint control.
         """
         logger.info(f"Sending action: {action}")
+        t_start = time.perf_counter()
 
         if not self._is_connected:
             logger.warning("Robot not connected, skipping action")
             return action
-        
-        # # Get activation status for joint control
+
+        # Get activation status for joint control
+        t_activation_start = time.perf_counter()
         left_active, right_active = self._get_joint_activation(action)
-        
+        t_activation_end = time.perf_counter()
+        logger.info(f"_get_joint_activation took {(t_activation_end - t_activation_start) * 1000:.2f} ms")
+
         try:
             # Control joints based on action (only if activated)
             if left_active or right_active:
+                t_joint_start = time.perf_counter()
                 self._control_joints(action)
-            
+                t_joint_end = time.perf_counter()
+                logger.info(f"_control_joints took {(t_joint_end - t_joint_start) * 1000:.2f} ms")
+
             # Control grippers based on action
+            t_gripper_start = time.perf_counter()
             self._control_grippers_from_action(action)
-            
+            t_gripper_end = time.perf_counter()
+            logger.info(f"_control_grippers_from_action took {(t_gripper_end - t_gripper_start) * 1000:.2f} ms")
+
         except Exception as e:
             logger.error(f"Failed to send action: {e}")
-        
+
+        t_end = time.perf_counter()
+        logger.info(f"send_action total took {(t_end - t_start) * 1000:.2f} ms")
+
         return action
 
     def _control_joints(self, action: RobotAction) -> None:

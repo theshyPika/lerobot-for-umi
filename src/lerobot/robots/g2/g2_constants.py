@@ -7,6 +7,10 @@
 # Minimum absolute change in normalized gripper command [0,1] to send a new command.
 GRIPPER_COMMAND_MIN_DELTA = 0.01
 
+# Hidden observation key used to pass the full-body joint state through the
+# processor pipeline without exposing it as a dataset feature.
+FULL_JOINT_POSITIONS_OBS_KEY = "_g2.full_joint_positions_deg_by_name"
+
 # SDK joint names in control order (radians from GDK).
 LEFT_ARM_JOINT_NAMES = [
     "idx21_arm_l_joint1",

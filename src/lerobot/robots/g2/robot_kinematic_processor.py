@@ -1,128 +1,153 @@
 import logging
 from dataclasses import dataclass, field
-from typing import Any
 
 import numpy as np
 
 from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
-from lerobot.model.kinematics import RobotKinematics
+from lerobot.model.kinematics import DualArmKinematics
 from lerobot.processor import (
-    EnvTransition,
-    ObservationProcessorStep,
-    ProcessorStep,
-    ProcessorStepRegistry,
     RobotAction,
     RobotActionProcessorStep,
-    RobotObservation,
+    ProcessorStepRegistry,
     TransitionKey,
 )
-from lerobot.utils.rotation import Rotation
+from lerobot.robots.g2.g2_constants import FULL_JOINT_POSITIONS_OBS_KEY
 
 
-@ProcessorStepRegistry.register("inverse_kinematics_ee_to_joints")
+@ProcessorStepRegistry.register("inverse_kinematics_delta_ee_to_joints")
 @dataclass
 class InverseKinematicsEEToJoints(RobotActionProcessorStep):
     """
-    Computes desired joint positions from a target end-effector pose using inverse kinematics (IK).
+    Computes desired joint positions from a delta end-effector pose in world frame using inverse kinematics (IK).
 
-    This step translates a Cartesian command (position and orientation of the end-effector) into
-    the corresponding joint-space commands for each motor.
+    Uses a unified ``DualArmKinematics`` solver so that both arms are solved in a single
+    placo iteration when running in dual-arm mode.  Single-arm mode is supported by simply
+    requesting only one side.
 
     Attributes:
-        kinematics: The robot's kinematic model for inverse kinematics.
+        kinematics: The unified dual-arm kinematic model.
         motor_names: A list of motor names for which to compute joint positions.
-        q_curr: Internal state storing the last joint positions, used as an initial guess for the IK solver.
+        left_q_curr: Internal state storing the last left joint positions.
+        right_q_curr: Internal state storing the last right joint positions.
         initial_guess_current_joints: If True, use the robot's current joint state as the IK guess.
-            If False, use the solution from the previous step.
+        use_relative_actions: If True, actions are interpreted as delta end-effector poses.
     """
 
     motor_names: list[str]
-    left_kinematics: RobotKinematics = None
-    right_kinematics: RobotKinematics = None
-    q_curr: np.ndarray | None = field(default=None, init=False, repr=False)
+    kinematics: DualArmKinematics | None = None
     left_q_curr: np.ndarray | None = field(default=None, init=False, repr=False)
     right_q_curr: np.ndarray | None = field(default=None, init=False, repr=False)
     initial_guess_current_joints: bool = True
-    
+    use_relative_actions: bool = True
+
     def action(self, action: RobotAction) -> RobotAction:
-        if self.left_kinematics:
-            left_result = self._action(
-                action=action,
-                prefix="l",
-                kinematics=self.left_kinematics,
-                motor_names=[name for name in self.motor_names if "l" in name],
-                q_curr_ref="left_q_curr"
-            )
-            action.update(left_result)
+        if self.kinematics is None:
+            return action
 
-        if self.right_kinematics:
-            right_result = self._action(
-                action=action,
-                prefix="r",
-                kinematics=self.right_kinematics,
-                motor_names=[name for name in self.motor_names if "r" in name],
-                q_curr_ref="right_q_curr"
-            )
-            action.update(right_result)
-            
-        return action
-    
-    def _action(self, action: RobotAction, prefix: str, 
-                    kinematics: RobotKinematics, motor_names: list[str],
-                    q_curr_ref: str) -> dict[str, float]:
-        logging.info(f"action in robot_kinematic_processor: {action}")
-        x = action.pop(f"{prefix}.ee.x")
-        y = action.pop(f"{prefix}.ee.y")
-        z = action.pop(f"{prefix}.ee.z")
-        wx = action.pop(f"{prefix}.ee.wx")
-        wy = action.pop(f"{prefix}.ee.wy")
-        wz = action.pop(f"{prefix}.ee.wz")
-        gripper_pos = action.pop(f"{prefix}.ee.gripper.pos")
-
-        if None in (x, y, z, wx, wy, wz, gripper_pos):
-            raise ValueError(
-                f"Missing required end-effector pose components for {prefix} arm: "
-                f"{prefix}.ee.x, {prefix}.ee.y, {prefix}.ee.z, {prefix}.ee.wx, "
-                f"{prefix}.ee.wy, {prefix}.ee.wz, {prefix}.ee.gripper_pos must all be present"
-            )
-
-        observation = self.transition.get(TransitionKey.OBSERVATION).copy()
+        observation = self.transition.get(TransitionKey.OBSERVATION)
         if observation is None:
-            raise ValueError("Joints observation is required for computing robot kinematics")
+            raise ValueError("Observation is required for computing robot kinematics")
+        observation = observation.copy()
+        logging.info(f"action in robot_kinematic_processor: {action}")
+        obs_ee_pose = {k: v for k, v in observation.items() if "ee" in k}
+        logging.info(f"observation ee pose: {obs_ee_pose}")
 
-        logging.info(f"observation : {observation}")
-        q_raw = np.array(
-            [float(v) for k, v in observation.items() 
-             if isinstance(k, str) and k.startswith(f"{prefix}.") and k.endswith(".pos")],
-            dtype=float,
+        full_joint_positions_deg_by_name = observation.get(FULL_JOINT_POSITIONS_OBS_KEY)
+        if not isinstance(full_joint_positions_deg_by_name, dict) or len(full_joint_positions_deg_by_name) == 0:
+            full_joint_positions_deg_by_name = None
+
+        # Prepare per-arm inputs
+        left_delta, left_target, left_q, left_joints = self._prepare_arm(
+            action, "l", observation
         )
-        
-        if len(q_raw) == 0:
-            raise ValueError(f"No joint positions found for {prefix} arm in observation")
+        right_delta, right_target, right_q, right_joints = self._prepare_arm(
+            action, "r", observation
+        )
 
-        q_curr = getattr(self, q_curr_ref)
-        if self.initial_guess_current_joints:  
-            q_curr = q_raw[:8] if prefix == 'l' or None in (self.left_kinematics, self.right_kinematics) else q_raw[8:]
-        else:  
-            if q_curr is None:
-                q_curr = q_raw[:8] if prefix == 'l' or None in (self.left_kinematics, self.right_kinematics) else q_raw[8:]
+        left_requested = left_delta is not None or left_target is not None
+        right_requested = right_delta is not None or right_target is not None
 
-        t_des = np.eye(4, dtype=float)
-        t_des[:3, :3] = Rotation.from_rotvec([wx, wy, wz]).as_matrix()
-        t_des[:3, 3] = [x, y, z]
+        if left_requested or right_requested:
+            left_result, right_result = self.kinematics.inverse_kinematics_dual(
+                left_current_joint_pos=left_q,
+                left_delta_ee=left_delta,
+                left_target_pose=left_target,
+                right_current_joint_pos=right_q,
+                right_delta_ee=right_delta,
+                right_target_pose=right_target,
+                current_joint_pos_by_name=full_joint_positions_deg_by_name,
+            )
 
-        q_target = kinematics.inverse_kinematics(q_curr, t_des)
-        
-        setattr(self, q_curr_ref, q_target)
+            if left_result is not None:
+                self.left_q_curr = left_result
+                for i, name in enumerate(left_joints):
+                    action[f"{name}.pos"] = float(left_result[i])
 
-        result = {}
-        for i, name in enumerate(motor_names):
-            if "gripper" not in name:
-                result[f"{name}.pos"] = float(q_target[i])
-            else:
-                result[f"{prefix}.gripper.pos"] = float(gripper_pos)
-        return result
+            if right_result is not None:
+                self.right_q_curr = right_result
+                for i, name in enumerate(right_joints):
+                    action[f"{name}.pos"] = float(right_result[i])
 
+        # Pop gripper actions after IK (they pass through)
+        for prefix in ("l", "r"):
+            gripper_key = f"{prefix}.ee.gripper.pos"
+            if gripper_key in action:
+                action[f"{prefix}.gripper.pos"] = action.pop(gripper_key)
+
+        return action
+
+    def _prepare_arm(
+        self,
+        action: RobotAction,
+        prefix: str,
+        observation: dict,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, list[str]]:
+        """Extract delta/target values and current joint positions for one arm.
+
+        Returns:
+            (delta_ee, target_pose, q_curr, joint_motor_names).
+            ``delta_ee`` is set when ``use_relative_actions`` is True,
+            ``target_pose`` is set otherwise. Both are None when the arm has no action keys.
+        """
+        ee_keys = [f"{prefix}.ee.{a}" for a in ("x", "y", "z", "wx", "wy", "wz")]
+        if not any(k in action for k in ee_keys):
+            return None, None, None, []
+
+        x = action.pop(f"{prefix}.ee.x", 0.0)
+        y = action.pop(f"{prefix}.ee.y", 0.0)
+        z = action.pop(f"{prefix}.ee.z", 0.0)
+        wx = action.pop(f"{prefix}.ee.wx", 0.0)
+        wy = action.pop(f"{prefix}.ee.wy", 0.0)
+        wz = action.pop(f"{prefix}.ee.wz", 0.0)
+
+        motor_names = [name for name in self.motor_names if name.startswith(f"{prefix}.")]
+        joint_motor_names = [name for name in motor_names if "gripper" not in name]
+        joint_keys = [f"{name}.pos" for name in joint_motor_names]
+        missing_joint_keys = [key for key in joint_keys if key not in observation]
+        if missing_joint_keys:
+            raise ValueError(
+                f"Missing joint positions for {prefix} arm in observation: {missing_joint_keys}"
+            )
+        q_raw = np.array([float(observation[key]) for key in joint_keys], dtype=float)
+
+        q_curr = self.left_q_curr if prefix == "l" else self.right_q_curr
+        if self.initial_guess_current_joints or q_curr is None:
+            q_curr = q_raw
+
+        pos_norm = np.linalg.norm([x, y, z])
+        rot_norm = np.linalg.norm([wx, wy, wz])
+        logging.info(f"[{prefix}] pos_norm={pos_norm:.4f}, rot_norm={rot_norm:.4f}")
+
+        if pos_norm < 2e-3 and rot_norm < 1e-1:
+            logging.info(f"All delta values are zero for {prefix} arm, skipping IK")
+            return None, None, q_curr, joint_motor_names
+
+        if self.use_relative_actions:
+            delta_ee = np.array([x, y, z, wx, wy, wz])
+            return delta_ee, None, q_curr, joint_motor_names
+        else:
+            target_pose = np.array([x, y, z, wx, wy, wz])
+            return None, target_pose, q_curr, joint_motor_names
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
