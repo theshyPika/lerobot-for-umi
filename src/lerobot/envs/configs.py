@@ -195,6 +195,8 @@ class InverseKinematicsConfig:
 
     urdf_path: str | None = None
     target_frame_name: str | None = None
+    reference_frame_name: str | None = None
+    use_relative_frame_task: bool = True
     end_effector_bounds: dict[str, list[float]] | None = None
     end_effector_step_sizes: dict[str, float] | None = None
 

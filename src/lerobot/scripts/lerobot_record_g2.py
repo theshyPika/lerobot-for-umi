@@ -107,7 +107,9 @@ from lerobot.processor import (
     make_default_processors,
 )
 from lerobot.processor.converters import (
+    observation_to_transition,
     robot_action_observation_to_transition,
+    transition_to_observation,
     transition_to_robot_action
 )
 from lerobot.processor.rename_processor import rename_stats
@@ -129,7 +131,10 @@ from lerobot.robots import (  # noqa: F401
 )
 from lerobot.robots.g2.g2_constants import LEFT_ARM_JOINT_NAMES, RIGHT_ARM_JOINT_NAMES
 # from lerobot.robots.g2.robot_kinematic_processor import InverseKinematicsEEToJoints
-from lerobot.robots.g2.robot_kinematic_processor import InverseKinematicsEEToJoints
+from lerobot.robots.g2.robot_kinematic_processor import (
+    ForwardKinematicsJointsToEEObservationG2,
+    InverseKinematicsEEToJoints,
+)
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
@@ -247,6 +252,16 @@ class RecordConfig:
     # Action interpolation multiplier for smoother policy control (1=off, 2=2x, 3=3x)
     # Only applies when using a policy (not teleop)
     interpolation_multiplier: int = 1
+    # Frame used for G2 end-effector observation/action poses. Use "world" for old base/world mode.
+    ee_reference_frame: str | None = "arm_base_link"
+    # Prefer placo's native relative frame task when ee_reference_frame is set.
+    use_relative_frame_task: bool = True
+    # URDF and end-effector frames used by the G2 FK/IK processors.
+    g2_urdf_path: str = "src/lerobot/robots/g2/G2/genie_robot/urdf/G2_t2_crs/model.urdf"
+    left_ee_target_frame: str = "arm_l_end_link"
+    right_ee_target_frame: str = "arm_r_end_link"
+    # Source data matches arm_{l/r}_end_link orientation with a +7mm local-z TCP position offset.
+    ee_tcp_offset: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.007])
 
     def __post_init__(self):
         # HACK: We parse again the cli args here to get the pretrained path if there was one.
@@ -433,7 +448,7 @@ def record_loop(
                         robot_type=robot.robot_type,
                     )
                     act_processed_policy = make_robot_action(action_values, dataset.features)
-                    robot_action_to_send = robot_action_processor((act_processed_policy, obs))
+                    robot_action_to_send = robot_action_processor((act_processed_policy, obs_processed))
 
                     action_tensor = torch.tensor([robot_action_to_send[k] for k in action_keys])
                     interpolator.add(action_tensor)
@@ -460,7 +475,7 @@ def record_loop(
                 )
                 act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
                 # Applies a pipeline to the action, default is IdentityProcessor
-                robot_action_to_send = robot_action_processor((act_processed_policy, obs))
+                robot_action_to_send = robot_action_processor((act_processed_policy, obs_processed))
                 action_values = act_processed_policy # fixed by ck
 
         elif policy is None and isinstance(teleop, Teleoperator):
@@ -471,7 +486,7 @@ def record_loop(
             # Applies a pipeline to the raw teleop action, default is IdentityProcessor
             act_processed_teleop = teleop_action_processor((act, obs))
             action_values = act_processed_teleop
-            robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
+            robot_action_to_send = robot_action_processor((act_processed_teleop, obs_processed))
 
         elif policy is None and isinstance(teleop, list):
             arm_action = teleop_arm.get_action()
@@ -481,7 +496,7 @@ def record_loop(
             act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
             act_processed_teleop = teleop_action_processor((act, obs))
             action_values = act_processed_teleop
-            robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
+            robot_action_to_send = robot_action_processor((act_processed_teleop, obs_processed))
         else:
             no_action_count += 1
             if no_action_count == 1 or no_action_count % 10 == 0:
@@ -539,16 +554,29 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
     teleop_action_processor, _, robot_observation_processor = make_default_processors()
 
-    g2_urdf_path = "src/lerobot/robots/g2/G2/genie_robot/urdf/G2_t2_crs/model.urdf"
     kinematics_solver = None
     if cfg.robot.use_left_arm or cfg.robot.use_right_arm:
         kinematics_solver = DualArmKinematics(
-            urdf_path=g2_urdf_path,
-            left_frame_name="arm_l_end_link" if cfg.robot.use_left_arm else None,
+            urdf_path=cfg.g2_urdf_path,
+            left_frame_name=cfg.left_ee_target_frame if cfg.robot.use_left_arm else None,
             left_joint_names=LEFT_ARM_JOINT_NAMES if cfg.robot.use_left_arm else None,
-            right_frame_name="arm_r_end_link" if cfg.robot.use_right_arm else None,
+            right_frame_name=cfg.right_ee_target_frame if cfg.robot.use_right_arm else None,
             right_joint_names=RIGHT_ARM_JOINT_NAMES if cfg.robot.use_right_arm else None,
+            reference_frame_name=cfg.ee_reference_frame,
+            use_relative_frame_task=cfg.use_relative_frame_task,
+            left_tcp_offset=cfg.ee_tcp_offset,
+            right_tcp_offset=cfg.ee_tcp_offset,
         )
+
+    robot_observation_processor = RobotProcessorPipeline[RobotObservation, RobotObservation](
+        steps=[
+            ForwardKinematicsJointsToEEObservationG2(
+                kinematics=kinematics_solver,
+            ),
+        ],
+        to_transition=observation_to_transition,
+        to_output=transition_to_observation,
+    )
 
     robot_ee_to_joints_processor = RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction](
         steps=[

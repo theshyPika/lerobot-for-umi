@@ -403,6 +403,8 @@ def make_processors(
         kinematics_solver = RobotKinematics(
             urdf_path=cfg.processor.inverse_kinematics.urdf_path,
             target_frame_name=cfg.processor.inverse_kinematics.target_frame_name,
+            reference_frame_name=cfg.processor.inverse_kinematics.reference_frame_name,
+            use_relative_frame_task=cfg.processor.inverse_kinematics.use_relative_frame_task,
             joint_names=motor_names,
         )
 

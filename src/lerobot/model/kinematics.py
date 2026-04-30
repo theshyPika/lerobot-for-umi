@@ -28,6 +28,8 @@ class RobotKinematics:
         self,
         urdf_path: str,
         target_frame_name: str = "gripper_frame_link",
+        reference_frame_name: str | None = None,
+        use_relative_frame_task: bool = True,
         joint_names: list[str] | None = None,
         max_iterations: int = 3,
         dt: float = 1e-2,
@@ -39,6 +41,10 @@ class RobotKinematics:
         Args:
             urdf_path (str): Path to the robot URDF file
             target_frame_name (str): Name of the end-effector frame in the URDF
+            reference_frame_name (str | None): Frame used to express FK outputs and IK inputs.
+                If None or "world", poses use placo's world/base frame.
+            use_relative_frame_task (bool): Prefer placo's native relative frame task when
+                reference_frame_name is set.
             joint_names (list[str] | None): List of joint names to use for the kinematics solver
             max_iterations (int): Maximum IK iterations per solve
             dt (float): Time step for velocity-based IK (larger = faster convergence, less stable)
@@ -59,6 +65,7 @@ class RobotKinematics:
         self.solver.enable_joint_limits = True
 
         self.target_frame_name = target_frame_name
+        self.reference_frame_name = self._normalize_reference_frame(reference_frame_name)
 
         # Set joint names
         self.all_joint_names = list(self.robot.joint_names())
@@ -66,7 +73,16 @@ class RobotKinematics:
         self.joint_names = self.all_joint_names if joint_names is None else joint_names
 
         # Initialize frame task for IK
-        self.tip_frame = self.solver.add_frame_task(self.target_frame_name, np.eye(4))
+        self._uses_relative_frame_task = False
+        if self.reference_frame_name is not None and use_relative_frame_task:
+            self.tip_frame = self.solver.add_relative_frame_task(
+                self.reference_frame_name,
+                self.target_frame_name,
+                np.eye(4),
+            )
+            self._uses_relative_frame_task = True
+        else:
+            self.tip_frame = self.solver.add_frame_task(self.target_frame_name, np.eye(4))
 
         # Mask irrelevant joints
         for j_name in self.all_joint_names:
@@ -84,8 +100,9 @@ class RobotKinematics:
         # position task
         self.position_task = None
         # Get current position of the target frame
-        self.position_task = self.solver.add_position_task(self.target_frame_name, np.zeros(3))
-        self.position_task.configure(f"{self.target_frame_name}_position", "soft", 1.0)
+        if not self._uses_relative_frame_task:
+            self.position_task = self.solver.add_position_task(self.target_frame_name, np.zeros(3))
+            self.position_task.configure(f"{self.target_frame_name}_position", "soft", 1.0)
         
 
         # Solver parameters
@@ -96,6 +113,22 @@ class RobotKinematics:
 
         # Cache for joint regularization dictionary to avoid repeated construction
         self._joint_reg_dict = {name: 0.0 for name in self.joint_names}
+
+    @staticmethod
+    def _normalize_reference_frame(reference_frame_name: str | None) -> str | None:
+        if reference_frame_name in (None, "", "world"):
+            return None
+        return reference_frame_name
+
+    def _get_frame_pose(self, frame_name: str) -> np.ndarray:
+        if self.reference_frame_name is None:
+            return np.array(self.robot.get_T_world_frame(frame_name), dtype=float)
+        return np.array(self.robot.get_T_a_b(self.reference_frame_name, frame_name), dtype=float)
+
+    def _reference_pose_to_world(self, pose: np.ndarray) -> np.ndarray:
+        if self.reference_frame_name is None:
+            return np.array(pose, dtype=float)
+        return self.robot.get_T_world_frame(self.reference_frame_name) @ pose
 
     def _set_robot_joint_positions(
         self,
@@ -137,7 +170,7 @@ class RobotKinematics:
         self.robot.update_kinematics()
 
         # Get the transformation matrix
-        return self.robot.get_T_world_frame(self.target_frame_name)
+        return self._get_frame_pose(self.target_frame_name)
 
     def inverse_kinematics(
             self,
@@ -153,8 +186,10 @@ class RobotKinematics:
 
             Args:
                 current_joint_pos: Current joint positions in degrees (initial guess).
-                delta_ee: Delta end-effector pose as [dx, dy, dz, dwx, dwy, dwz] in world frame.
-                target_pose: Absolute target pose as 4x4 transformation matrix (used if delta_ee is None).
+                delta_ee: Delta end-effector pose as [dx, dy, dz, dwx, dwy, dwz] in the
+                    configured reference frame, or world/base frame if reference_frame_name is None.
+                target_pose: Absolute target pose as 4x4 transformation matrix in the configured
+                    reference frame, or world/base frame if reference_frame_name is None.
                 position_weight: Weight for position constraint in IK.
                 orientation_weight: Weight for orientation constraint in IK.
                 current_joint_pos_by_name: Optional full-body joint positions in degrees,
@@ -179,7 +214,7 @@ class RobotKinematics:
 
             # Determine desired_ee_pose
             if delta_ee is not None:
-                current_ee_pose = self.robot.get_T_world_frame(self.target_frame_name)
+                current_ee_pose = self._get_frame_pose(self.target_frame_name)
                 current_pos = current_ee_pose[:3, 3]
                 current_rot = Rotation.from_matrix(current_ee_pose[:3, :3])
 
@@ -200,10 +235,14 @@ class RobotKinematics:
                 logging.info(f"Delta: {delta_ee}")
                 logging.info(f"Target:  {_format_pose(desired_ee_pose)}")
             else:
-                desired_ee_pose = target_pose
+                desired_ee_pose = np.array(target_pose, dtype=float)
 
             # Configure IK tasks
-            self.tip_frame.T_world_frame = desired_ee_pose
+            if self._uses_relative_frame_task:
+                self.tip_frame.T_a_b = desired_ee_pose
+            else:
+                desired_ee_pose = self._reference_pose_to_world(desired_ee_pose)
+                self.tip_frame.T_world_frame = desired_ee_pose
             self.tip_frame.configure(self.target_frame_name, "soft", position_weight, orientation_weight)
 
             # Update position task target if it exists
@@ -261,6 +300,10 @@ class DualArmKinematics:
         left_joint_names: list[str] | None = None,
         right_frame_name: str | None = None,
         right_joint_names: list[str] | None = None,
+        reference_frame_name: str | None = None,
+        use_relative_frame_task: bool = True,
+        left_tcp_offset: np.ndarray | list[float] | tuple[float, float, float] | None = None,
+        right_tcp_offset: np.ndarray | list[float] | tuple[float, float, float] | None = None,
         max_iterations: int = 3,
         dt: float = 1e-2,
         eps: float = 1e-6,
@@ -284,6 +327,10 @@ class DualArmKinematics:
 
         self.left_frame_name = left_frame_name
         self.right_frame_name = right_frame_name
+        self.reference_frame_name = RobotKinematics._normalize_reference_frame(reference_frame_name)
+        self._uses_relative_frame_task = self.reference_frame_name is not None and use_relative_frame_task
+        self.left_tcp_offset = self._make_offset_transform(left_tcp_offset)
+        self.right_tcp_offset = self._make_offset_transform(right_tcp_offset)
         self.left_joint_names = list(left_joint_names) if left_joint_names is not None else []
         self.right_joint_names = list(right_joint_names) if right_joint_names is not None else []
 
@@ -299,25 +346,68 @@ class DualArmKinematics:
         self.left_manip = None
         self.left_position_task = None
         if self.left_frame_name:
-            self.left_tip = self.solver.add_frame_task(self.left_frame_name, np.eye(4))
+            self.left_tip = self._add_frame_task(self.left_frame_name)
             self.left_manip = self.solver.add_manipulability_task(self.left_frame_name, "both", 1.0)
             self.left_manip.configure("manip_left", "soft", 1e-2)
-            self.left_position_task = self.solver.add_position_task(self.left_frame_name, np.zeros(3))
-            self.left_position_task.configure(f"{self.left_frame_name}_position", "soft", 1.0)
+            if not self._uses_relative_frame_task:
+                self.left_position_task = self.solver.add_position_task(self.left_frame_name, np.zeros(3))
+                self.left_position_task.configure(f"{self.left_frame_name}_position", "soft", 1.0)
 
         self.right_tip = None
         self.right_manip = None
         self.right_position_task = None
         if self.right_frame_name:
-            self.right_tip = self.solver.add_frame_task(self.right_frame_name, np.eye(4))
+            self.right_tip = self._add_frame_task(self.right_frame_name)
             self.right_manip = self.solver.add_manipulability_task(self.right_frame_name, "both", 1.0)
             self.right_manip.configure("manip_right", "soft", 1e-2)
-            self.right_position_task = self.solver.add_position_task(self.right_frame_name, np.zeros(3))
-            self.right_position_task.configure(f"{self.right_frame_name}_position", "soft", 1.0)
+            if not self._uses_relative_frame_task:
+                self.right_position_task = self.solver.add_position_task(self.right_frame_name, np.zeros(3))
+                self.right_position_task.configure(f"{self.right_frame_name}_position", "soft", 1.0)
 
         self.solver.dt = dt
         self.solver.eps = eps
         self.solver.damping = 0.2
+
+    def _add_frame_task(self, frame_name: str):
+        if self._uses_relative_frame_task:
+            return self.solver.add_relative_frame_task(self.reference_frame_name, frame_name, np.eye(4))
+        return self.solver.add_frame_task(frame_name, np.eye(4))
+
+    @staticmethod
+    def _make_offset_transform(offset: np.ndarray | list[float] | tuple[float, float, float] | None) -> np.ndarray:
+        transform = np.eye(4, dtype=float)
+        if offset is not None:
+            offset = np.asarray(offset, dtype=float)
+            if offset.shape != (3,):
+                raise ValueError(f"TCP offset must have shape (3,), got {offset.shape}.")
+            transform[:3, 3] = offset
+        return transform
+
+    def _get_frame_pose(self, frame_name: str, tcp_offset: np.ndarray | None = None) -> np.ndarray:
+        if self.reference_frame_name is None:
+            pose = np.array(self.robot.get_T_world_frame(frame_name), dtype=float)
+        else:
+            pose = np.array(self.robot.get_T_a_b(self.reference_frame_name, frame_name), dtype=float)
+        if tcp_offset is not None:
+            pose = pose @ tcp_offset
+        return pose
+
+    def _reference_pose_to_world(self, pose: np.ndarray) -> np.ndarray:
+        if self.reference_frame_name is None:
+            return np.array(pose, dtype=float)
+        return self.robot.get_T_world_frame(self.reference_frame_name) @ pose
+
+    @staticmethod
+    def _tcp_pose_to_frame_pose(tcp_pose: np.ndarray, tcp_offset: np.ndarray) -> np.ndarray:
+        return tcp_pose @ np.linalg.inv(tcp_offset)
+
+    def _set_tip_target(self, tip, frame_name: str, target_pose: np.ndarray) -> np.ndarray:
+        if self._uses_relative_frame_task:
+            tip.T_a_b = target_pose
+            return target_pose
+        target_world = self._reference_pose_to_world(target_pose)
+        tip.T_world_frame = target_world
+        return target_world
 
     def _set_robot_joint_positions(
         self,
@@ -347,10 +437,11 @@ class DualArmKinematics:
         delta_ee: np.ndarray | None,
         target_pose: np.ndarray | None,
         frame_name: str,
+        tcp_offset: np.ndarray,
     ) -> np.ndarray:
         """Compute desired target pose from delta or absolute pose."""
         if delta_ee is not None:
-            current_ee_pose = self.robot.get_T_world_frame(frame_name)
+            current_ee_pose = self._get_frame_pose(frame_name, tcp_offset)
             current_pos = current_ee_pose[:3, 3]
             current_rot = Rotation.from_matrix(current_ee_pose[:3, :3])
 
@@ -391,9 +482,9 @@ class DualArmKinematics:
             joint_pos_deg: Full-body joint positions in degrees, keyed by URDF joint name.
 
         Returns:
-            Dictionary with fixed keys ``"left"`` and ``"right"``.
-            Each value is a 4x4 pose matrix; for an unenabled arm a zero matrix
-            ``np.zeros((4, 4))`` is returned as a placeholder.
+            Tuple ``(left_pose, right_pose)``. Each value is a 4x4 pose matrix;
+            for an unenabled arm a zero matrix ``np.zeros((4, 4))`` is returned
+            as a placeholder.
         """
         self._set_robot_joint_positions(joint_pos_deg)
         self.robot.update_kinematics()
@@ -401,9 +492,9 @@ class DualArmKinematics:
         left_pose = np.zeros((4, 4), dtype=float)
         right_pose = np.zeros((4, 4), dtype=float)
         if self.left_frame_name:
-            left_pose = self.robot.get_T_world_frame(self.left_frame_name)
+            left_pose = self._get_frame_pose(self.left_frame_name, self.left_tcp_offset)
         if self.right_frame_name:
-            right_pose = self.robot.get_T_world_frame(self.right_frame_name)
+            right_pose = self._get_frame_pose(self.right_frame_name, self.right_tcp_offset)
         return (left_pose, right_pose)
 
     def inverse_kinematics_dual(
@@ -451,34 +542,40 @@ class DualArmKinematics:
         # Compute target poses
         left_target = None
         if left_requested:
-            left_target = self._compute_target_pose(left_delta_ee, left_target_pose, self.left_frame_name)
-            self.left_tip.T_world_frame = left_target
+            left_target = self._compute_target_pose(
+                left_delta_ee, left_target_pose, self.left_frame_name, self.left_tcp_offset
+            )
+            left_frame_target = self._tcp_pose_to_frame_pose(left_target, self.left_tcp_offset)
+            left_target_world = self._set_tip_target(self.left_tip, self.left_frame_name, left_frame_target)
             self.left_tip.configure(self.left_frame_name, "soft", position_weight, orientation_weight)
             if self.left_position_task is not None:
-                self.left_position_task.target_world = left_target[:3, 3]
+                self.left_position_task.target_world = left_target_world[:3, 3]
 
         right_target = None
         if right_requested:
-            right_target = self._compute_target_pose(right_delta_ee, right_target_pose, self.right_frame_name)
-            self.right_tip.T_world_frame = right_target
+            right_target = self._compute_target_pose(
+                right_delta_ee, right_target_pose, self.right_frame_name, self.right_tcp_offset
+            )
+            right_frame_target = self._tcp_pose_to_frame_pose(right_target, self.right_tcp_offset)
+            right_target_world = self._set_tip_target(self.right_tip, self.right_frame_name, right_frame_target)
             self.right_tip.configure(self.right_frame_name, "soft", position_weight, orientation_weight)
             if self.right_position_task is not None:
-                self.right_position_task.target_world = right_target[:3, 3]
+                self.right_position_task.target_world = right_target_world[:3, 3]
 
         # Freeze inactive arms by pinning them at their current FK pose.
         # This prevents stale frame_task targets from conflicting with the
         # updated joint state when only one arm is being controlled.
         if not left_requested and self.left_frame_name:
-            current_left_pose = self.robot.get_T_world_frame(self.left_frame_name)
-            self.left_tip.T_world_frame = current_left_pose
+            current_left_pose = self._get_frame_pose(self.left_frame_name)
+            current_left_world = self._set_tip_target(self.left_tip, self.left_frame_name, current_left_pose)
             if self.left_position_task is not None:
-                self.left_position_task.target_world = current_left_pose[:3, 3]
+                self.left_position_task.target_world = current_left_world[:3, 3]
 
         if not right_requested and self.right_frame_name:
-            current_right_pose = self.robot.get_T_world_frame(self.right_frame_name)
-            self.right_tip.T_world_frame = current_right_pose
+            current_right_pose = self._get_frame_pose(self.right_frame_name)
+            current_right_world = self._set_tip_target(self.right_tip, self.right_frame_name, current_right_pose)
             if self.right_position_task is not None:
-                self.right_position_task.target_world = current_right_pose[:3, 3]
+                self.right_position_task.target_world = current_right_world[:3, 3]
 
         # Iterative solve
         converged = False

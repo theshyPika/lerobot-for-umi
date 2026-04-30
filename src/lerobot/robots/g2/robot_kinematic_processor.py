@@ -6,23 +6,76 @@ import numpy as np
 from lerobot.configs.types import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.model.kinematics import DualArmKinematics
 from lerobot.processor import (
+    ObservationProcessorStep,
     RobotAction,
     RobotActionProcessorStep,
+    RobotObservation,
     ProcessorStepRegistry,
     TransitionKey,
 )
 from lerobot.robots.g2.g2_constants import FULL_JOINT_POSITIONS_OBS_KEY
+from lerobot.utils.rotation import Rotation
+
+
+@ProcessorStepRegistry.register("g2_forward_kinematics_joints_to_ee_observation")
+@dataclass
+class ForwardKinematicsJointsToEEObservationG2(ObservationProcessorStep):
+    """Replace SDK EE observations with FK poses from the configured kinematics reference frame."""
+
+    kinematics: DualArmKinematics | None = None
+
+    def observation(self, observation: RobotObservation) -> RobotObservation:
+        observation = dict(observation)
+        if self.kinematics is None:
+            return observation
+
+        full_joint_positions_deg_by_name = observation.get(FULL_JOINT_POSITIONS_OBS_KEY)
+        if not isinstance(full_joint_positions_deg_by_name, dict) or len(full_joint_positions_deg_by_name) == 0:
+            return observation
+
+        left_pose, right_pose = self.kinematics.forward_kinematics(full_joint_positions_deg_by_name)
+        if self.kinematics.left_frame_name:
+            observation.update(self._pose_to_observation(left_pose, "l", observation))
+        if self.kinematics.right_frame_name:
+            observation.update(self._pose_to_observation(right_pose, "r", observation))
+        return observation
+
+    def _pose_to_observation(
+        self,
+        pose: np.ndarray,
+        prefix: str,
+        observation: RobotObservation,
+    ) -> dict[str, float]:
+        rotvec = Rotation.from_matrix(pose[:3, :3]).as_rotvec()
+        result = {
+            f"{prefix}.ee.x": float(pose[0, 3]),
+            f"{prefix}.ee.y": float(pose[1, 3]),
+            f"{prefix}.ee.z": float(pose[2, 3]),
+            f"{prefix}.ee.wx": float(rotvec[0]),
+            f"{prefix}.ee.wy": float(rotvec[1]),
+            f"{prefix}.ee.wz": float(rotvec[2]),
+        }
+        gripper_key = f"{prefix}.ee.gripper.pos"
+        if gripper_key in observation:
+            result[gripper_key] = float(observation[gripper_key])
+        return result
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
 
 
 @ProcessorStepRegistry.register("inverse_kinematics_delta_ee_to_joints")
 @dataclass
 class InverseKinematicsEEToJoints(RobotActionProcessorStep):
     """
-    Computes desired joint positions from a delta end-effector pose in world frame using inverse kinematics (IK).
+    Computes desired joint positions from an end-effector pose using inverse kinematics (IK).
 
     Uses a unified ``DualArmKinematics`` solver so that both arms are solved in a single
     placo iteration when running in dual-arm mode.  Single-arm mode is supported by simply
-    requesting only one side.
+    requesting only one side. End-effector actions are interpreted in the kinematics solver's
+    configured reference frame, e.g. ``arm_base_link`` for G2 recording.
 
     Attributes:
         kinematics: The unified dual-arm kinematic model.
@@ -134,15 +187,15 @@ class InverseKinematicsEEToJoints(RobotActionProcessorStep):
         if self.initial_guess_current_joints or q_curr is None:
             q_curr = q_raw
 
-        pos_norm = np.linalg.norm([x, y, z])
-        rot_norm = np.linalg.norm([wx, wy, wz])
-        logging.info(f"[{prefix}] pos_norm={pos_norm:.4f}, rot_norm={rot_norm:.4f}")
-
-        if pos_norm < 2e-3 and rot_norm < 1e-1:
-            logging.info(f"All delta values are zero for {prefix} arm, skipping IK")
-            return None, None, q_curr, joint_motor_names
-
         if self.use_relative_actions:
+            pos_norm = np.linalg.norm([x, y, z])
+            rot_norm = np.linalg.norm([wx, wy, wz])
+            logging.info(f"[{prefix}] pos_norm={pos_norm:.4f}, rot_norm={rot_norm:.4f}")
+
+            if pos_norm < 2e-3 and rot_norm < 1e-1:
+                logging.info(f"All delta values are zero for {prefix} arm, skipping IK")
+                return None, None, q_curr, joint_motor_names
+
             delta_ee = np.array([x, y, z, wx, wy, wz])
             return delta_ee, None, q_curr, joint_motor_names
         else:
