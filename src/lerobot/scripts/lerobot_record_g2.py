@@ -262,6 +262,10 @@ class RecordConfig:
     right_ee_target_frame: str = "arm_r_end_link"
     # Source data matches arm_{l/r}_end_link orientation with a +7mm local-z TCP position offset.
     ee_tcp_offset: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.007])
+    # Skip IK for an arm when the absolute EE target is already close to the current EE observation.
+    # This prevents near-hold commands from being re-solved into a different redundant joint posture.
+    ee_hold_position_threshold_m: float = 0.002
+    ee_hold_rotation_threshold_rad: float = 0.02
 
     def __post_init__(self):
         # HACK: We parse again the cli args here to get the pretrained path if there was one.
@@ -554,24 +558,27 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
     teleop_action_processor, _, robot_observation_processor = make_default_processors()
 
-    kinematics_solver = None
+    fk_kinematics_solver = None
+    ik_kinematics_solver = None
     if cfg.robot.use_left_arm or cfg.robot.use_right_arm:
-        kinematics_solver = DualArmKinematics(
-            urdf_path=cfg.g2_urdf_path,
-            left_frame_name=cfg.left_ee_target_frame if cfg.robot.use_left_arm else None,
-            left_joint_names=LEFT_ARM_JOINT_NAMES if cfg.robot.use_left_arm else None,
-            right_frame_name=cfg.right_ee_target_frame if cfg.robot.use_right_arm else None,
-            right_joint_names=RIGHT_ARM_JOINT_NAMES if cfg.robot.use_right_arm else None,
-            reference_frame_name=cfg.ee_reference_frame,
-            use_relative_frame_task=cfg.use_relative_frame_task,
-            left_tcp_offset=cfg.ee_tcp_offset,
-            right_tcp_offset=cfg.ee_tcp_offset,
-        )
+        kinematics_kwargs = {
+            "urdf_path": cfg.g2_urdf_path,
+            "left_frame_name": cfg.left_ee_target_frame if cfg.robot.use_left_arm else None,
+            "left_joint_names": LEFT_ARM_JOINT_NAMES if cfg.robot.use_left_arm else None,
+            "right_frame_name": cfg.right_ee_target_frame if cfg.robot.use_right_arm else None,
+            "right_joint_names": RIGHT_ARM_JOINT_NAMES if cfg.robot.use_right_arm else None,
+            "reference_frame_name": cfg.ee_reference_frame,
+            "use_relative_frame_task": cfg.use_relative_frame_task,
+            "left_tcp_offset": cfg.ee_tcp_offset,
+            "right_tcp_offset": cfg.ee_tcp_offset,
+        }
+        fk_kinematics_solver = DualArmKinematics(**kinematics_kwargs)
+        ik_kinematics_solver = DualArmKinematics(**kinematics_kwargs)
 
     robot_observation_processor = RobotProcessorPipeline[RobotObservation, RobotObservation](
         steps=[
             ForwardKinematicsJointsToEEObservationG2(
-                kinematics=kinematics_solver,
+                kinematics=fk_kinematics_solver,
             ),
         ],
         to_transition=observation_to_transition,
@@ -582,9 +589,11 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         steps=[
             InverseKinematicsEEToJoints(
                 motor_names=list(robot.motors),
-                kinematics=kinematics_solver,
+                kinematics=ik_kinematics_solver,
                 initial_guess_current_joints=True,
-                use_relative_actions=False # TODO： refactor after due to the always absolute action output by prediction actions. @ck
+                use_relative_actions=False, # TODO： refactor after due to the always absolute action output by prediction actions. @ck
+                ee_hold_position_threshold_m=cfg.ee_hold_position_threshold_m,
+                ee_hold_rotation_threshold_rad=cfg.ee_hold_rotation_threshold_rad,
             ),
         ],
         to_transition=robot_action_observation_to_transition,

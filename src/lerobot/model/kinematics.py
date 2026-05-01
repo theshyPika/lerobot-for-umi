@@ -15,6 +15,7 @@
 import logging
 from collections.abc import Mapping
 import time
+import xml.etree.ElementTree as ET
 
 import numpy as np
 
@@ -320,6 +321,7 @@ class DualArmKinematics:
             raise ValueError("At least one of left_frame_name or right_frame_name must be provided.")
 
         self.max_iterations = max_iterations
+        self.joint_limits_deg = self._load_joint_limits_deg(urdf_path)
         self.robot = placo.RobotWrapper(urdf_path)
         self.solver = placo.KinematicsSolver(self.robot)
         self.solver.mask_fbase(True)
@@ -367,6 +369,50 @@ class DualArmKinematics:
         self.solver.dt = dt
         self.solver.eps = eps
         self.solver.damping = 0.2
+
+    @staticmethod
+    def _load_joint_limits_deg(urdf_path: str) -> dict[str, tuple[float, float]]:
+        joint_limits: dict[str, tuple[float, float]] = {}
+        try:
+            root = ET.parse(urdf_path).getroot()
+        except Exception as exc:
+            logging.warning("Failed to parse URDF joint limits from %s: %s", urdf_path, exc)
+            return joint_limits
+
+        for joint in root.findall("joint"):
+            name = joint.attrib.get("name")
+            limit = joint.find("limit")
+            if not name or limit is None:
+                continue
+            lower = limit.attrib.get("lower")
+            upper = limit.attrib.get("upper")
+            if lower is None or upper is None:
+                continue
+            try:
+                joint_limits[name] = (float(np.rad2deg(float(lower))), float(np.rad2deg(float(upper))))
+            except ValueError:
+                continue
+        return joint_limits
+
+    def _clip_joint_positions_deg(self, joint_names: list[str], joint_values_deg: np.ndarray) -> np.ndarray:
+        clipped = np.array(joint_values_deg, dtype=float, copy=True)
+        for i, joint_name in enumerate(joint_names):
+            joint_limit = self.joint_limits_deg.get(joint_name)
+            if joint_limit is None:
+                continue
+            lower, upper = joint_limit
+            before = clipped[i]
+            clipped[i] = float(np.clip(before, lower, upper))
+            if clipped[i] != before:
+                logging.warning(
+                    "IK result for %s clipped from %.4f deg to %.4f deg within [%.4f, %.4f]",
+                    joint_name,
+                    before,
+                    clipped[i],
+                    lower,
+                    upper,
+                )
+        return clipped
 
     def _add_frame_task(self, frame_name: str):
         if self._uses_relative_frame_task:
@@ -610,12 +656,12 @@ class DualArmKinematics:
         left_result = None
         if left_requested:
             left_rad = [self.robot.get_joint(name) for name in self.left_joint_names]
-            left_result = np.rad2deg(left_rad)
+            left_result = self._clip_joint_positions_deg(self.left_joint_names, np.rad2deg(left_rad))
 
         right_result = None
         if right_requested:
             right_rad = [self.robot.get_joint(name) for name in self.right_joint_names]
-            right_result = np.rad2deg(right_rad)
+            right_result = self._clip_joint_positions_deg(self.right_joint_names, np.rad2deg(right_rad))
         t_ik_end = time.perf_counter()
         logging.info(f"IK took {(t_ik_end - t_ik_start)*1000:.2f} ms")
         return left_result, right_result

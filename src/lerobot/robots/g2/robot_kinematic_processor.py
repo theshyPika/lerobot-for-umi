@@ -92,6 +92,8 @@ class InverseKinematicsEEToJoints(RobotActionProcessorStep):
     right_q_curr: np.ndarray | None = field(default=None, init=False, repr=False)
     initial_guess_current_joints: bool = True
     use_relative_actions: bool = True
+    ee_hold_position_threshold_m: float = 0.002
+    ee_hold_rotation_threshold_rad: float = 0.02
 
     def action(self, action: RobotAction) -> RobotAction:
         if self.kinematics is None:
@@ -132,11 +134,23 @@ class InverseKinematicsEEToJoints(RobotActionProcessorStep):
             )
 
             if left_result is not None:
+                left_joint_delta = left_result - left_q
+                logging.info(
+                    "[l] IK joint_delta_deg max=%.4f values=%s",
+                    float(np.max(np.abs(left_joint_delta))),
+                    np.array2string(left_joint_delta, precision=4, suppress_small=True),
+                )
                 self.left_q_curr = left_result
                 for i, name in enumerate(left_joints):
                     action[f"{name}.pos"] = float(left_result[i])
 
             if right_result is not None:
+                right_joint_delta = right_result - right_q
+                logging.info(
+                    "[r] IK joint_delta_deg max=%.4f values=%s",
+                    float(np.max(np.abs(right_joint_delta))),
+                    np.array2string(right_joint_delta, precision=4, suppress_small=True),
+                )
                 self.right_q_curr = right_result
                 for i, name in enumerate(right_joints):
                     action[f"{name}.pos"] = float(right_result[i])
@@ -198,9 +212,36 @@ class InverseKinematicsEEToJoints(RobotActionProcessorStep):
 
             delta_ee = np.array([x, y, z, wx, wy, wz])
             return delta_ee, None, q_curr, joint_motor_names
+
+        obs_pose_keys = [f"{prefix}.ee.{a}" for a in ("x", "y", "z", "wx", "wy", "wz")]
+        if all(k in observation for k in obs_pose_keys):
+            obs_pose = np.array([float(observation[k]) for k in obs_pose_keys], dtype=float)
+            target_pose = np.array([x, y, z, wx, wy, wz], dtype=float)
+            pose_delta = target_pose - obs_pose
+            pos_norm = float(np.linalg.norm(pose_delta[:3]))
+            rot_norm = float(np.linalg.norm(pose_delta[3:]))
+            logging.info(
+                f"[{prefix}] absolute EE delta pos_norm={pos_norm:.6f}, rot_norm={rot_norm:.6f}"
+            )
+            if (
+                self.ee_hold_position_threshold_m > 0.0
+                and self.ee_hold_rotation_threshold_rad > 0.0
+                and pos_norm < self.ee_hold_position_threshold_m
+                and rot_norm < self.ee_hold_rotation_threshold_rad
+            ):
+                logging.info(
+                    f"[{prefix}] EE target within hold deadband "
+                    f"({self.ee_hold_position_threshold_m:.4f} m, "
+                    f"{self.ee_hold_rotation_threshold_rad:.4f} rad); skipping IK"
+                )
+                return None, None, q_curr, joint_motor_names
+
         else:
             target_pose = np.array([x, y, z, wx, wy, wz])
             return None, target_pose, q_curr, joint_motor_names
+
+        target_pose = np.array([x, y, z, wx, wy, wz])
+        return None, target_pose, q_curr, joint_motor_names
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
