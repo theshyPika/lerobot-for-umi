@@ -63,7 +63,7 @@ class RobotKinematics:
         self.robot = placo.RobotWrapper(urdf_path)
         self.solver = placo.KinematicsSolver(self.robot)
         self.solver.mask_fbase(True)  # Fix the base
-        self.solver.enable_joint_limits = True
+        self.solver.enable_joint_limits(True)
 
         self.target_frame_name = target_frame_name
         self.reference_frame_name = self._normalize_reference_frame(reference_frame_name)
@@ -97,14 +97,6 @@ class RobotKinematics:
         # Manipulability task (optional, helps avoid singularities)
         self.manipulability = self.solver.add_manipulability_task(target_frame_name, "both", 1.0)
         self.manipulability.configure("manipulability", "soft", 1e-2)
-
-        # position task
-        self.position_task = None
-        # Get current position of the target frame
-        if not self._uses_relative_frame_task:
-            self.position_task = self.solver.add_position_task(self.target_frame_name, np.zeros(3))
-            self.position_task.configure(f"{self.target_frame_name}_position", "soft", 1.0)
-        
 
         # Solver parameters
         self.solver.dt = dt
@@ -246,9 +238,6 @@ class RobotKinematics:
                 self.tip_frame.T_world_frame = desired_ee_pose
             self.tip_frame.configure(self.target_frame_name, "soft", position_weight, orientation_weight)
 
-            # Update position task target if it exists
-            if self.position_task is not None:
-                self.position_task.target_world = desired_ee_pose[:3, 3]
             # undo constraint
             # for i, joint_name in enumerate(self.joint_names):
             #     self._joint_reg_dict[joint_name] = current_joint_rad[i]
@@ -294,6 +283,29 @@ class DualArmKinematics:
     for that arm.
     """
 
+    G2_ARM_JOINT_SAFETY_MARGIN_DEG = 0.5
+    IK_POSITION_TOLERANCE_M = 1e-2
+    IK_ORIENTATION_TOLERANCE_RAD = 1e-1
+    IK_REACHABILITY_ALPHAS = (1.0, 0.5, 0.25, 0.125, 0.0625)
+    G2_ARM_JOINT_NAMES = frozenset(
+        {
+            "idx21_arm_l_joint1",
+            "idx22_arm_l_joint2",
+            "idx23_arm_l_joint3",
+            "idx24_arm_l_joint4",
+            "idx25_arm_l_joint5",
+            "idx26_arm_l_joint6",
+            "idx27_arm_l_joint7",
+            "idx61_arm_r_joint1",
+            "idx62_arm_r_joint2",
+            "idx63_arm_r_joint3",
+            "idx64_arm_r_joint4",
+            "idx65_arm_r_joint5",
+            "idx66_arm_r_joint6",
+            "idx67_arm_r_joint7",
+        }
+    )
+
     def __init__(
         self,
         urdf_path: str,
@@ -322,10 +334,11 @@ class DualArmKinematics:
 
         self.max_iterations = max_iterations
         self.joint_limits_deg = self._load_joint_limits_deg(urdf_path)
+        self._apply_g2_arm_joint_safety_margin()
         self.robot = placo.RobotWrapper(urdf_path)
         self.solver = placo.KinematicsSolver(self.robot)
         self.solver.mask_fbase(True)
-        self.solver.enable_joint_limits = True
+        self.solver.enable_joint_limits(True)
 
         self.left_frame_name = left_frame_name
         self.right_frame_name = right_frame_name
@@ -346,25 +359,17 @@ class DualArmKinematics:
 
         self.left_tip = None
         self.left_manip = None
-        self.left_position_task = None
         if self.left_frame_name:
             self.left_tip = self._add_frame_task(self.left_frame_name)
             self.left_manip = self.solver.add_manipulability_task(self.left_frame_name, "both", 1.0)
             self.left_manip.configure("manip_left", "soft", 1e-2)
-            if not self._uses_relative_frame_task:
-                self.left_position_task = self.solver.add_position_task(self.left_frame_name, np.zeros(3))
-                self.left_position_task.configure(f"{self.left_frame_name}_position", "soft", 1.0)
 
         self.right_tip = None
         self.right_manip = None
-        self.right_position_task = None
         if self.right_frame_name:
             self.right_tip = self._add_frame_task(self.right_frame_name)
             self.right_manip = self.solver.add_manipulability_task(self.right_frame_name, "both", 1.0)
             self.right_manip.configure("manip_right", "soft", 1e-2)
-            if not self._uses_relative_frame_task:
-                self.right_position_task = self.solver.add_position_task(self.right_frame_name, np.zeros(3))
-                self.right_position_task.configure(f"{self.right_frame_name}_position", "soft", 1.0)
 
         self.solver.dt = dt
         self.solver.eps = eps
@@ -394,25 +399,55 @@ class DualArmKinematics:
                 continue
         return joint_limits
 
-    def _clip_joint_positions_deg(self, joint_names: list[str], joint_values_deg: np.ndarray) -> np.ndarray:
-        clipped = np.array(joint_values_deg, dtype=float, copy=True)
+    def _apply_g2_arm_joint_safety_margin(self) -> None:
+        margin = self.G2_ARM_JOINT_SAFETY_MARGIN_DEG
+        for joint_name in self.G2_ARM_JOINT_NAMES:
+            joint_limit = self.joint_limits_deg.get(joint_name)
+            if joint_limit is None:
+                continue
+            lower, upper = joint_limit
+            if upper - lower <= 2 * margin:
+                logging.warning(
+                    "Skipping safety margin for %s because limits [%.4f, %.4f] are too narrow",
+                    joint_name,
+                    lower,
+                    upper,
+                )
+                continue
+            self.joint_limits_deg[joint_name] = (lower + margin, upper - margin)
+
+    def _joint_positions_within_limits(self, joint_names: list[str], joint_values_deg: np.ndarray) -> bool:
+        if not np.all(np.isfinite(joint_values_deg)):
+            return False
+
         for i, joint_name in enumerate(joint_names):
             joint_limit = self.joint_limits_deg.get(joint_name)
             if joint_limit is None:
                 continue
             lower, upper = joint_limit
-            before = clipped[i]
-            clipped[i] = float(np.clip(before, lower, upper))
-            if clipped[i] != before:
+            value = float(joint_values_deg[i])
+            if value < lower or value > upper:
                 logging.warning(
-                    "IK result for %s clipped from %.4f deg to %.4f deg within [%.4f, %.4f]",
+                    "IK raw result for %s is out of limit: %.4f deg not in [%.4f, %.4f]",
                     joint_name,
-                    before,
-                    clipped[i],
+                    value,
                     lower,
                     upper,
                 )
-        return clipped
+                return False
+        return True
+
+    @staticmethod
+    def _interpolate_pose(start_pose: np.ndarray, target_pose: np.ndarray, alpha: float) -> np.ndarray:
+        alpha = float(np.clip(alpha, 0.0, 1.0))
+        pose = np.eye(4, dtype=float)
+        pose[:3, 3] = start_pose[:3, 3] + alpha * (target_pose[:3, 3] - start_pose[:3, 3])
+
+        start_rot = Rotation.from_matrix(start_pose[:3, :3])
+        target_rot = Rotation.from_matrix(target_pose[:3, :3])
+        delta_rot = target_rot * start_rot.inv()
+        pose[:3, :3] = (Rotation.from_rotvec(alpha * delta_rot.as_rotvec()) * start_rot).as_matrix()
+        return pose
 
     def _add_frame_task(self, frame_name: str):
         if self._uses_relative_frame_task:
@@ -576,92 +611,141 @@ class DualArmKinematics:
         if right_requested and not self.right_frame_name:
             raise ValueError("Right arm IK requested but right_frame_name was not configured.")
 
-        # Set full-body state first, then override the controllable arm joints
-        if current_joint_pos_by_name is not None:
-            self._set_robot_joint_positions(current_joint_pos_by_name)
-        if left_requested:
-            self._set_robot_joint_positions(left_current_joint_pos, joint_names=self.left_joint_names)
-        if right_requested:
-            self._set_robot_joint_positions(right_current_joint_pos, joint_names=self.right_joint_names)
-        self.robot.update_kinematics()
+        def reset_robot_state() -> None:
+            # Set full-body state first, then override the controllable arm joints.
+            if current_joint_pos_by_name is not None:
+                self._set_robot_joint_positions(current_joint_pos_by_name)
+            if left_requested:
+                self._set_robot_joint_positions(left_current_joint_pos, joint_names=self.left_joint_names)
+            if right_requested:
+                self._set_robot_joint_positions(right_current_joint_pos, joint_names=self.right_joint_names)
+            self.robot.update_kinematics()
+
+        reset_robot_state()
 
         # Compute target poses
         left_target = None
+        left_start = None
         if left_requested:
+            left_start = self._get_frame_pose(self.left_frame_name, self.left_tcp_offset)
             left_target = self._compute_target_pose(
                 left_delta_ee, left_target_pose, self.left_frame_name, self.left_tcp_offset
             )
-            left_frame_target = self._tcp_pose_to_frame_pose(left_target, self.left_tcp_offset)
-            left_target_world = self._set_tip_target(self.left_tip, self.left_frame_name, left_frame_target)
-            self.left_tip.configure(self.left_frame_name, "soft", position_weight, orientation_weight)
-            if self.left_position_task is not None:
-                self.left_position_task.target_world = left_target_world[:3, 3]
 
         right_target = None
+        right_start = None
         if right_requested:
+            right_start = self._get_frame_pose(self.right_frame_name, self.right_tcp_offset)
             right_target = self._compute_target_pose(
                 right_delta_ee, right_target_pose, self.right_frame_name, self.right_tcp_offset
             )
-            right_frame_target = self._tcp_pose_to_frame_pose(right_target, self.right_tcp_offset)
-            right_target_world = self._set_tip_target(self.right_tip, self.right_frame_name, right_frame_target)
-            self.right_tip.configure(self.right_frame_name, "soft", position_weight, orientation_weight)
-            if self.right_position_task is not None:
-                self.right_position_task.target_world = right_target_world[:3, 3]
 
-        # Freeze inactive arms by pinning them at their current FK pose.
-        # This prevents stale frame_task targets from conflicting with the
-        # updated joint state when only one arm is being controlled.
-        if not left_requested and self.left_frame_name:
-            current_left_pose = self._get_frame_pose(self.left_frame_name)
-            current_left_world = self._set_tip_target(self.left_tip, self.left_frame_name, current_left_pose)
-            if self.left_position_task is not None:
-                self.left_position_task.target_world = current_left_world[:3, 3]
+        def set_task_targets(alpha: float) -> None:
+            if left_requested:
+                assert left_start is not None and left_target is not None
+                left_candidate = self._interpolate_pose(left_start, left_target, alpha)
+                left_frame_target = self._tcp_pose_to_frame_pose(left_candidate, self.left_tcp_offset)
+                self._set_tip_target(self.left_tip, self.left_frame_name, left_frame_target)
+                self.left_tip.configure(self.left_frame_name, "soft", position_weight, orientation_weight)
 
-        if not right_requested and self.right_frame_name:
-            current_right_pose = self._get_frame_pose(self.right_frame_name)
-            current_right_world = self._set_tip_target(self.right_tip, self.right_frame_name, current_right_pose)
-            if self.right_position_task is not None:
-                self.right_position_task.target_world = current_right_world[:3, 3]
+            if right_requested:
+                assert right_start is not None and right_target is not None
+                right_candidate = self._interpolate_pose(right_start, right_target, alpha)
+                right_frame_target = self._tcp_pose_to_frame_pose(right_candidate, self.right_tcp_offset)
+                self._set_tip_target(self.right_tip, self.right_frame_name, right_frame_target)
+                self.right_tip.configure(self.right_frame_name, "soft", position_weight, orientation_weight)
 
-        # Iterative solve
-        converged = False
-        for iteration in range(self.max_iterations):
-            try:
-                self.solver.solve(True)
-                self.robot.update_kinematics()
+            # Freeze inactive arms by pinning them at their current FK pose.
+            # This prevents stale frame_task targets from conflicting with the
+            # updated joint state when only one arm is being controlled.
+            if not left_requested and self.left_frame_name:
+                current_left_pose = self._get_frame_pose(self.left_frame_name)
+                self._set_tip_target(self.left_tip, self.left_frame_name, current_left_pose)
 
-                left_ok = not left_requested
-                right_ok = not right_requested
+            if not right_requested and self.right_frame_name:
+                current_right_pose = self._get_frame_pose(self.right_frame_name)
+                self._set_tip_target(self.right_tip, self.right_frame_name, current_right_pose)
 
-                if left_requested:
-                    lp = self.left_tip.position().error_norm()
-                    lo = np.linalg.norm(self.left_tip.orientation().error())
-                    left_ok = lp < 1e-2 and lo < 1e-1
-                if right_requested:
-                    rp = self.right_tip.position().error_norm()
-                    ro = np.linalg.norm(self.right_tip.orientation().error())
-                    right_ok = rp < 1e-2 and ro < 1e-1
+        def task_errors_ok() -> bool:
+            left_ok = not left_requested
+            right_ok = not right_requested
 
-                if left_ok and right_ok:
-                    converged = True
-                    logging.debug(f"Dual IK converged after {iteration + 1} iterations")
+            if left_requested:
+                lp = self.left_tip.position().error_norm()
+                lo = np.linalg.norm(self.left_tip.orientation().error())
+                left_ok = lp < self.IK_POSITION_TOLERANCE_M and lo < self.IK_ORIENTATION_TOLERANCE_RAD
+            if right_requested:
+                rp = self.right_tip.position().error_norm()
+                ro = np.linalg.norm(self.right_tip.orientation().error())
+                right_ok = rp < self.IK_POSITION_TOLERANCE_M and ro < self.IK_ORIENTATION_TOLERANCE_RAD
+            return left_ok and right_ok
+
+        def read_raw_results() -> tuple[np.ndarray | None, np.ndarray | None]:
+            left_result = None
+            if left_requested:
+                left_rad = [self.robot.get_joint(name) for name in self.left_joint_names]
+                left_result = np.rad2deg(left_rad)
+
+            right_result = None
+            if right_requested:
+                right_rad = [self.robot.get_joint(name) for name in self.right_joint_names]
+                right_result = np.rad2deg(right_rad)
+            return left_result, right_result
+
+        def results_within_limits(left_result: np.ndarray | None, right_result: np.ndarray | None) -> bool:
+            if left_result is not None and not self._joint_positions_within_limits(self.left_joint_names, left_result):
+                return False
+            if right_result is not None and not self._joint_positions_within_limits(self.right_joint_names, right_result):
+                return False
+            return True
+
+        best_left_result = None
+        best_right_result = None
+        solved_alpha = None
+        for alpha in self.IK_REACHABILITY_ALPHAS:
+            reset_robot_state()
+            set_task_targets(alpha)
+
+            converged = False
+            solver_failed = False
+            for iteration in range(self.max_iterations):
+                try:
+                    self.solver.solve(True)
+                    self.robot.update_kinematics()
+                    if task_errors_ok():
+                        converged = True
+                        logging.debug(
+                            "Dual IK converged after %d iterations at reachability alpha %.4f",
+                            iteration + 1,
+                            alpha,
+                        )
+                        break
+                except RuntimeError as e:
+                    solver_failed = True
+                    logging.warning("Dual IK iteration %d failed at alpha %.4f: %s", iteration + 1, alpha, e)
                     break
-            except RuntimeError as e:
-                logging.warning(f"Dual IK iteration {iteration + 1} failed: {e}")
-                break
 
-        if not converged:
-            logging.debug(f"Dual IK did not converge within {self.max_iterations} iterations")
+            left_result, right_result = read_raw_results()
+            if solver_failed:
+                continue
+            if not converged:
+                logging.debug("Dual IK did not converge at reachability alpha %.4f", alpha)
+                continue
+            if not results_within_limits(left_result, right_result):
+                continue
 
-        left_result = None
-        if left_requested:
-            left_rad = [self.robot.get_joint(name) for name in self.left_joint_names]
-            left_result = self._clip_joint_positions_deg(self.left_joint_names, np.rad2deg(left_rad))
+            best_left_result = left_result
+            best_right_result = right_result
+            solved_alpha = alpha
+            break
 
-        right_result = None
-        if right_requested:
-            right_rad = [self.robot.get_joint(name) for name in self.right_joint_names]
-            right_result = self._clip_joint_positions_deg(self.right_joint_names, np.rad2deg(right_rad))
+        if solved_alpha is None:
+            logging.warning("Dual IK failed to find a reachable in-limit target; holding current joints")
+            best_left_result = np.array(left_current_joint_pos, dtype=float, copy=True) if left_requested else None
+            best_right_result = np.array(right_current_joint_pos, dtype=float, copy=True) if right_requested else None
+        elif solved_alpha < 1.0:
+            logging.info("Dual IK used reachable fallback target with alpha %.4f", solved_alpha)
+
         t_ik_end = time.perf_counter()
         logging.info(f"IK took {(t_ik_end - t_ik_start)*1000:.2f} ms")
-        return left_result, right_result
+        return best_left_result, best_right_result
