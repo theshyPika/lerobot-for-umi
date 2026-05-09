@@ -94,6 +94,8 @@ class InverseKinematicsEEToJoints(RobotActionProcessorStep):
     use_relative_actions: bool = True
     ee_hold_position_threshold_m: float = 0.002
     ee_hold_rotation_threshold_rad: float = 0.02
+    ik_position_weight: float = 1.0
+    ik_orientation_weight: float = 1e-2
 
     def action(self, action: RobotAction) -> RobotAction:
         if self.kinematics is None:
@@ -130,6 +132,8 @@ class InverseKinematicsEEToJoints(RobotActionProcessorStep):
                 right_current_joint_pos=right_q,
                 right_delta_ee=right_delta,
                 right_target_pose=right_target,
+                position_weight=self.ik_position_weight,
+                orientation_weight=self.ik_orientation_weight,
                 current_joint_pos_by_name=full_joint_positions_deg_by_name,
             )
 

@@ -22,6 +22,24 @@ import numpy as np
 from lerobot.utils.rotation import Rotation
 
 
+IK_ORIENTATION_TASK_MIN_WEIGHT = 1e-6
+
+
+def _configure_split_frame_task(frame_task, task_name: str, position_weight: float, orientation_weight: float) -> None:
+    """Configure frame position/orientation subtasks independently.
+
+    Keeping the orientation task active with a tiny lower-bound weight lets it
+    regularize wrist posture without allowing a large orientation error to block
+    position convergence.
+    """
+    frame_task.position().configure(f"{task_name}_position", "soft", float(position_weight))
+    frame_task.orientation().configure(
+        f"{task_name}_orientation",
+        "soft",
+        max(float(orientation_weight), IK_ORIENTATION_TASK_MIN_WEIGHT),
+    )
+
+
 class RobotKinematics:
     """Robot kinematics using placo library for forward and inverse kinematics."""
 
@@ -236,7 +254,12 @@ class RobotKinematics:
             else:
                 desired_ee_pose = self._reference_pose_to_world(desired_ee_pose)
                 self.tip_frame.T_world_frame = desired_ee_pose
-            self.tip_frame.configure(self.target_frame_name, "soft", position_weight, orientation_weight)
+            _configure_split_frame_task(
+                self.tip_frame,
+                self.target_frame_name,
+                position_weight,
+                orientation_weight,
+            )
 
             # undo constraint
             # for i, joint_name in enumerate(self.joint_names):
@@ -252,9 +275,14 @@ class RobotKinematics:
 
                     pos_err = self.tip_frame.position().error_norm()
                     orient_err = np.linalg.norm(self.tip_frame.orientation().error())
-                    if pos_err < 1e-2 and orient_err < 1e-1:
+                    if pos_err < 1e-2:
                         converged = True
-                        logging.debug(f"IK converged after {iteration + 1} iterations")
+                        logging.debug(
+                            "IK converged after %d iterations: pos=%.6f, orient=%.6f",
+                            iteration + 1,
+                            pos_err,
+                            orient_err,
+                        )
                         break
                 except RuntimeError as e:
                     logging.warning(f"IK iteration {iteration + 1} failed: {e}")
@@ -647,7 +675,12 @@ class DualArmKinematics:
             )
             left_frame_target = self._tcp_pose_to_frame_pose(left_target, self.left_tcp_offset)
             self._set_tip_target(self.left_tip, self.left_frame_name, left_frame_target)
-            self.left_tip.configure(self.left_frame_name, "soft", position_weight, orientation_weight)
+            _configure_split_frame_task(
+                self.left_tip,
+                self.left_frame_name,
+                position_weight,
+                orientation_weight,
+            )
 
         right_target = None
         if right_requested:
@@ -656,15 +689,32 @@ class DualArmKinematics:
             )
             right_frame_target = self._tcp_pose_to_frame_pose(right_target, self.right_tcp_offset)
             self._set_tip_target(self.right_tip, self.right_frame_name, right_frame_target)
-            self.right_tip.configure(self.right_frame_name, "soft", position_weight, orientation_weight)
+            _configure_split_frame_task(
+                self.right_tip,
+                self.right_frame_name,
+                position_weight,
+                orientation_weight,
+            )
 
         if not left_requested and self.left_frame_name:
             current_left_pose = self._get_frame_pose(self.left_frame_name)
             self._set_tip_target(self.left_tip, self.left_frame_name, current_left_pose)
+            _configure_split_frame_task(
+                self.left_tip,
+                self.left_frame_name,
+                position_weight,
+                orientation_weight,
+            )
 
         if not right_requested and self.right_frame_name:
             current_right_pose = self._get_frame_pose(self.right_frame_name)
             self._set_tip_target(self.right_tip, self.right_frame_name, current_right_pose)
+            _configure_split_frame_task(
+                self.right_tip,
+                self.right_frame_name,
+                position_weight,
+                orientation_weight,
+            )
 
         converged = False
         for iteration in range(self.max_iterations):
@@ -678,11 +728,13 @@ class DualArmKinematics:
                 if left_requested:
                     lp = self.left_tip.position().error_norm()
                     lo = np.linalg.norm(self.left_tip.orientation().error())
-                    left_ok = lp < self.IK_POSITION_TOLERANCE_M and lo < self.IK_ORIENTATION_TOLERANCE_RAD
+                    left_ok = lp < self.IK_POSITION_TOLERANCE_M
+                    logging.debug("Dual IK iter %d [l]: pos=%.6f, orient=%.6f", iteration, lp, lo)
                 if right_requested:
                     rp = self.right_tip.position().error_norm()
                     ro = np.linalg.norm(self.right_tip.orientation().error())
-                    right_ok = rp < self.IK_POSITION_TOLERANCE_M and ro < self.IK_ORIENTATION_TOLERANCE_RAD
+                    right_ok = rp < self.IK_POSITION_TOLERANCE_M
+                    logging.debug("Dual IK iter %d [r]: pos=%.6f, orient=%.6f", iteration, rp, ro)
 
                 if left_ok and right_ok:
                     converged = True

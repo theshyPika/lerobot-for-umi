@@ -266,6 +266,10 @@ class RecordConfig:
     # This prevents near-hold commands from being re-solved into a different redundant joint posture.
     ee_hold_position_threshold_m: float = 0.002
     ee_hold_rotation_threshold_rad: float = 0.02
+    # IK frame task weights. Orientation remains active but defaults low so
+    # position tracking dominates redundant/unreachable wrist orientations.
+    ik_position_weight: float = 1.0
+    ik_orientation_weight: float = 1e-2
 
     def __post_init__(self):
         # HACK: We parse again the cli args here to get the pretrained path if there was one.
@@ -594,6 +598,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 use_relative_actions=False, # TODO： refactor after due to the always absolute action output by prediction actions. @ck
                 ee_hold_position_threshold_m=cfg.ee_hold_position_threshold_m,
                 ee_hold_rotation_threshold_rad=cfg.ee_hold_rotation_threshold_rad,
+                ik_position_weight=cfg.ik_position_weight,
+                ik_orientation_weight=cfg.ik_orientation_weight,
             ),
         ],
         to_transition=robot_action_observation_to_transition,
