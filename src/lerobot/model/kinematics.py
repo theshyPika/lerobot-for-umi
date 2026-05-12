@@ -12,14 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import logging
-from collections.abc import Mapping
 import time
 import xml.etree.ElementTree as ET
+from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 import numpy as np
 
+from lerobot.utils.import_utils import _placo_available, require_package
 from lerobot.utils.rotation import Rotation
+
+if TYPE_CHECKING or _placo_available:
+    import placo  # type: ignore[import-not-found]
+else:
+    placo = None
 
 
 IK_ORIENTATION_TASK_MIN_WEIGHT = 1e-6
@@ -69,13 +78,7 @@ class RobotKinematics:
             dt (float): Time step for velocity-based IK (larger = faster convergence, less stable)
             eps (float): Convergence threshold for IK
         """
-        try:
-            import placo  # type: ignore[import-not-found]
-        except ImportError as e:
-            raise ImportError(
-                "placo is required for RobotKinematics. "
-                "Please install the optional dependencies of `kinematics` in the package."
-            ) from e
+        require_package("placo", extra="placo-dep")
 
         self.max_iterations = max_iterations
         self.robot = placo.RobotWrapper(urdf_path)
