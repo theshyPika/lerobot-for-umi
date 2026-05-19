@@ -211,6 +211,12 @@ def write_tasks(tasks: pandas.DataFrame, local_dir: Path) -> None:
     tasks.to_parquet(path)
 
 
+def write_subtasks(subtasks: pandas.DataFrame, local_dir: Path) -> None:
+    path = local_dir / DEFAULT_SUBTASKS_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subtasks.to_parquet(path)
+
+
 def load_tasks(local_dir: Path) -> pandas.DataFrame:
     tasks = pd.read_parquet(local_dir / DEFAULT_TASKS_PATH)
     tasks.index.name = "task"

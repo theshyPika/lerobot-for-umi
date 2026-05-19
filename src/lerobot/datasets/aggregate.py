@@ -32,6 +32,7 @@ from lerobot.datasets.io_utils import (
     to_parquet_with_hf_images,
     write_info,
     write_stats,
+    write_subtasks,
     write_tasks,
 )
 from lerobot.datasets.utils import (
@@ -102,6 +103,19 @@ def update_data_df(df, src_meta, dst_meta):
 
     src_task_names = src_meta.tasks.index.take(df["task_index"].to_numpy())
     df["task_index"] = dst_meta.tasks.loc[src_task_names, "task_index"].to_numpy()
+
+    if "subtask_index" in df.columns:
+        if dst_meta.subtasks is None:
+            raise ValueError(
+                f"Dataset {src_meta.repo_id} has a subtask_index column, but destination subtasks "
+                "metadata was not initialized."
+            )
+        if src_meta.subtasks is None:
+            raise ValueError(
+                f"Dataset {src_meta.repo_id} has a subtask_index column but no subtasks metadata."
+            )
+        src_subtask_names = src_meta.subtasks.index.take(df["subtask_index"].to_numpy())
+        df["subtask_index"] = dst_meta.subtasks.loc[src_subtask_names, "subtask_index"].to_numpy()
 
     return df
 
@@ -294,6 +308,27 @@ def aggregate_datasets(
     dst_meta.tasks = pd.DataFrame(
         {"task_index": range(len(unique_tasks))}, index=pd.Index(unique_tasks, name="task")
     )
+
+    has_subtask_feature = any("subtask_index" in m.features for m in all_metadata)
+    has_subtask_metadata = any(m.subtasks is not None for m in all_metadata)
+    if has_subtask_feature:
+        missing = [m.repo_id for m in all_metadata if m.subtasks is None]
+        if missing:
+            raise ValueError(
+                "Cannot aggregate datasets with subtask_index feature but missing subtasks metadata. "
+                f"Missing subtasks metadata for: {missing}"
+            )
+        subtasks_metadata = [m.subtasks for m in all_metadata]
+        unique_subtasks = pd.concat(subtasks_metadata).index.unique()
+        dst_meta.subtasks = pd.DataFrame(
+            {"subtask_index": range(len(unique_subtasks))}, index=pd.Index(unique_subtasks, name="subtask")
+        )
+    elif has_subtask_metadata:
+        unexpected = [m.repo_id for m in all_metadata if m.subtasks is not None]
+        raise ValueError(
+            "Cannot aggregate datasets with subtasks metadata but no subtask_index feature. "
+            f"Unexpected subtasks metadata for: {unexpected}"
+        )
 
     meta_idx = {"chunk": 0, "file": 0}
     data_idx = {"chunk": 0, "file": 0}
@@ -639,6 +674,10 @@ def finalize_aggregation(aggr_meta, all_metadata):
     logging.info("write tasks")
     write_tasks(aggr_meta.tasks, aggr_meta.root)
 
+    if aggr_meta.subtasks is not None:
+        logging.info("write subtasks")
+        write_subtasks(aggr_meta.subtasks, aggr_meta.root)
+
     logging.info("write info")
     aggr_meta.info.update(
         {
@@ -651,5 +690,10 @@ def finalize_aggregation(aggr_meta, all_metadata):
     write_info(aggr_meta.info, aggr_meta.root)
 
     logging.info("write stats")
-    aggr_meta.stats = aggregate_stats([m.stats for m in all_metadata])
+    meta_keys = {"index", "episode_index", "task_index", "subtask_index", "frame_index", "timestamp"}
+    aggr_meta.stats = {
+        key: value
+        for key, value in aggregate_stats([m.stats for m in all_metadata]).items()
+        if key in aggr_meta.features and key not in meta_keys
+    }
     write_stats(aggr_meta.stats, aggr_meta.root)
