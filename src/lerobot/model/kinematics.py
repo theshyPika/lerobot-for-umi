@@ -280,7 +280,7 @@ class RobotKinematics:
                     orient_err = np.linalg.norm(self.tip_frame.orientation().error())
                     if pos_err < 1e-2:
                         converged = True
-                        logging.debug(
+                        logging.info(
                             "IK converged after %d iterations: pos=%.6f, orient=%.6f",
                             iteration + 1,
                             pos_err,
@@ -292,7 +292,7 @@ class RobotKinematics:
                     break
 
             if not converged:
-                logging.debug(f"IK did not converge within {self.max_iterations} iterations")
+                logging.info(f"IK did not converge within {self.max_iterations} iterations")
 
             # Extract result
             joint_pos_rad = [self.robot.get_joint(name) for name in self.joint_names]
@@ -314,10 +314,9 @@ class DualArmKinematics:
     for that arm.
     """
 
-    G2_ARM_JOINT_SAFETY_MARGIN_DEG = 0.5
-    IK_POSITION_TOLERANCE_M = 1e-2
-    IK_ORIENTATION_TOLERANCE_RAD = 1e-1
-    IK_REACHABILITY_ALPHAS = (1.0, 0.5, 0.25, 0.125, 0.0625)
+    G2_ARM_JOINT_SAFETY_MARGIN_DEG = 0.1
+    IK_POSITION_TOLERANCE_M = 1e-3
+    IK_ORIENTATION_TOLERANCE_RAD = 1e-2
     G2_ARM_JOINT_NAMES = frozenset(
         {
             "idx21_arm_l_joint1",
@@ -369,7 +368,7 @@ class DualArmKinematics:
         self.robot = placo.RobotWrapper(urdf_path)
         self.solver = placo.KinematicsSolver(self.robot)
         self.solver.mask_fbase(True)
-        self.solver.enable_joint_limits(True)
+        self.solver.enable_joint_limits(False) # fixed by ck, attention: critic error, cannot setup with True, will product large eror norm in position and orientation.
 
         self.left_frame_name = left_frame_name
         self.right_frame_name = right_frame_name
@@ -393,18 +392,18 @@ class DualArmKinematics:
         if self.left_frame_name:
             self.left_tip = self._add_frame_task(self.left_frame_name)
             self.left_manip = self.solver.add_manipulability_task(self.left_frame_name, "both", 1.0)
-            self.left_manip.configure("manip_left", "soft", 1e-2)
+            self.left_manip.configure("manip_left", "soft", 1e-3)
 
         self.right_tip = None
         self.right_manip = None
         if self.right_frame_name:
             self.right_tip = self._add_frame_task(self.right_frame_name)
             self.right_manip = self.solver.add_manipulability_task(self.right_frame_name, "both", 1.0)
-            self.right_manip.configure("manip_right", "soft", 1e-2)
+            self.right_manip.configure("manip_right", "soft", 1e-3)
 
         self.solver.dt = dt
         self.solver.eps = eps
-        self.solver.damping = 0.2
+        self.solver.damping = 0.6
 
     @staticmethod
     def _load_joint_limits_deg(urdf_path: str) -> dict[str, tuple[float, float]]:
@@ -532,6 +531,14 @@ class DualArmKinematics:
     @staticmethod
     def _tcp_pose_to_frame_pose(tcp_pose: np.ndarray, tcp_offset: np.ndarray) -> np.ndarray:
         return tcp_pose @ np.linalg.inv(tcp_offset)
+
+    @staticmethod
+    def _pose_error_norms(target_pose: np.ndarray, current_pose: np.ndarray) -> tuple[float, float]:
+        pos_err = float(np.linalg.norm(target_pose[:3, 3] - current_pose[:3, 3]))
+        target_rot = Rotation.from_matrix(target_pose[:3, :3])
+        current_rot = Rotation.from_matrix(current_pose[:3, :3])
+        orient_err = float(np.linalg.norm((target_rot * current_rot.inv()).as_rotvec()))
+        return pos_err, orient_err
 
     def _set_tip_target(self, tip, frame_name: str, target_pose: np.ndarray) -> np.ndarray:
         if self._uses_relative_frame_task:
@@ -672,12 +679,15 @@ class DualArmKinematics:
 
         # Compute target poses
         left_target = None
+        left_frame_target = None
         if left_requested:
             left_target = self._compute_target_pose(
                 left_delta_ee, left_target_pose, self.left_frame_name, self.left_tcp_offset
             )
             left_frame_target = self._tcp_pose_to_frame_pose(left_target, self.left_tcp_offset)
             self._set_tip_target(self.left_tip, self.left_frame_name, left_frame_target)
+            lp, lo = self._pose_error_norms(left_frame_target, self._get_frame_pose(self.left_frame_name))
+            logging.info("IK_DIAG [l] pre_task_error pos=%.6f orient=%.6f", lp, lo)
             _configure_split_frame_task(
                 self.left_tip,
                 self.left_frame_name,
@@ -686,12 +696,15 @@ class DualArmKinematics:
             )
 
         right_target = None
+        right_frame_target = None
         if right_requested:
             right_target = self._compute_target_pose(
                 right_delta_ee, right_target_pose, self.right_frame_name, self.right_tcp_offset
             )
             right_frame_target = self._tcp_pose_to_frame_pose(right_target, self.right_tcp_offset)
             self._set_tip_target(self.right_tip, self.right_frame_name, right_frame_target)
+            rp, ro = self._pose_error_norms(right_frame_target, self._get_frame_pose(self.right_frame_name))
+            logging.info("IK_DIAG [r] pre_task_error pos=%.6f orient=%.6f", rp, ro)
             _configure_split_frame_task(
                 self.right_tip,
                 self.right_frame_name,
@@ -731,34 +744,66 @@ class DualArmKinematics:
                 if left_requested:
                     lp = self.left_tip.position().error_norm()
                     lo = np.linalg.norm(self.left_tip.orientation().error())
+                    real_lp, real_lo = self._pose_error_norms(
+                        left_frame_target,
+                        self._get_frame_pose(self.left_frame_name),
+                    )
                     left_ok = lp < self.IK_POSITION_TOLERANCE_M
-                    logging.debug("Dual IK iter %d [l]: pos=%.6f, orient=%.6f", iteration, lp, lo)
+                    logging.info(
+                        "IK_DIAG iter %d [l]: task_pos=%.6f task_orient=%.6f real_pos=%.6f real_orient=%.6f",
+                        iteration,
+                        lp,
+                        lo,
+                        real_lp,
+                        real_lo,
+                    )
                 if right_requested:
                     rp = self.right_tip.position().error_norm()
                     ro = np.linalg.norm(self.right_tip.orientation().error())
+                    real_rp, real_ro = self._pose_error_norms(
+                        right_frame_target,
+                        self._get_frame_pose(self.right_frame_name),
+                    )
                     right_ok = rp < self.IK_POSITION_TOLERANCE_M
-                    logging.debug("Dual IK iter %d [r]: pos=%.6f, orient=%.6f", iteration, rp, ro)
+                    logging.info(
+                        "IK_DIAG iter %d [r]: task_pos=%.6f task_orient=%.6f real_pos=%.6f real_orient=%.6f",
+                        iteration,
+                        rp,
+                        ro,
+                        real_rp,
+                        real_ro,
+                    )
 
                 if left_ok and right_ok:
                     converged = True
-                    logging.debug("Dual IK converged after %d iterations", iteration + 1)
+                    logging.info("Dual IK converged after %d iterations", iteration + 1)
                     break
             except RuntimeError as e:
                 logging.warning("Dual IK iteration %d failed: %s", iteration + 1, e)
                 break
 
         if not converged:
-            logging.debug("Dual IK did not converge within %d iterations", self.max_iterations)
+            logging.info("Dual IK did not converge within %d iterations", self.max_iterations)
 
         left_result = None
         if left_requested:
             left_rad = [self.robot.get_joint(name) for name in self.left_joint_names]
-            left_result = self._clip_joint_positions_deg(self.left_joint_names, np.rad2deg(left_rad))
+            left_raw_deg = np.rad2deg(left_rad)
+            logging.info(
+                "[l] IK raw_joint_delta_deg values=%s",
+                np.array2string(left_raw_deg - left_current_joint_pos[: len(self.left_joint_names)], precision=6, suppress_small=False),
+            )
+            left_result = self._clip_joint_positions_deg(self.left_joint_names, left_raw_deg)
 
         right_result = None
         if right_requested:
             right_rad = [self.robot.get_joint(name) for name in self.right_joint_names]
-            right_result = self._clip_joint_positions_deg(self.right_joint_names, np.rad2deg(right_rad))
+            right_raw_deg = np.rad2deg(right_rad)
+            logging.info(
+                "[r] IK raw_joint_delta_deg values=%s",
+                np.array2string(right_raw_deg - right_current_joint_pos[: len(self.right_joint_names)], precision=6, suppress_small=False),
+            )
+            right_result = self._clip_joint_positions_deg(self.right_joint_names, right_raw_deg)
 
         t_ik_end = time.perf_counter()
         logging.info(f"IK took {(t_ik_end - t_ik_start)*1000:.2f} ms")

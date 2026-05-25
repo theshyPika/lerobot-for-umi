@@ -17,6 +17,11 @@ from lerobot.robots.g2.g2_constants import FULL_JOINT_POSITIONS_OBS_KEY
 from lerobot.utils.rotation import Rotation
 
 
+# TODO(g2-frame-refactor): 这一步存在是为了把 GDK 自带 frame 的 EE 覆写成
+# arm_base_link 系，但同时引入了 "raw vs processed observation" 二元性，
+# 触发了 strategies/core.py:_dispatch_action 和 base_panic 里的 frame mismatch bug
+# （见 plan hashed-roaming-riddle.md）。
+# 等 G2Robot.get_observation() 直接产出 arm_base_link 系 EE 后，本步骤即可删除。
 @ProcessorStepRegistry.register("g2_forward_kinematics_joints_to_ee_observation")
 @dataclass
 class ForwardKinematicsJointsToEEObservationG2(ObservationProcessorStep):
@@ -92,8 +97,8 @@ class InverseKinematicsEEToJoints(RobotActionProcessorStep):
     right_q_curr: np.ndarray | None = field(default=None, init=False, repr=False)
     initial_guess_current_joints: bool = True
     use_relative_actions: bool = True
-    ee_hold_position_threshold_m: float = 0.002
-    ee_hold_rotation_threshold_rad: float = 0.02
+    ee_hold_position_threshold_m: float = 0.001
+    ee_hold_rotation_threshold_rad: float = 0.01
     ik_position_weight: float = 1.0
     ik_orientation_weight: float = 1e-2
 
@@ -159,6 +164,15 @@ class InverseKinematicsEEToJoints(RobotActionProcessorStep):
                 for i, name in enumerate(right_joints):
                     action[f"{name}.pos"] = float(right_result[i])
 
+        # For arms that were not solved (e.g., deadband-held), command current joint
+        # positions so downstream consumers see a complete joint action dict.
+        if left_joints and left_q is not None:
+            for i, name in enumerate(left_joints):
+                action.setdefault(f"{name}.pos", float(left_q[i]))
+        if right_joints and right_q is not None:
+            for i, name in enumerate(right_joints):
+                action.setdefault(f"{name}.pos", float(right_q[i]))
+
         # Pop gripper actions after IK (they pass through)
         for prefix in ("l", "r"):
             gripper_key = f"{prefix}.ee.gripper.pos"
@@ -223,7 +237,9 @@ class InverseKinematicsEEToJoints(RobotActionProcessorStep):
             target_pose = np.array([x, y, z, wx, wy, wz], dtype=float)
             pose_delta = target_pose - obs_pose
             pos_norm = float(np.linalg.norm(pose_delta[:3]))
-            rot_norm = float(np.linalg.norm(pose_delta[3:]))
+            target_rot = Rotation.from_rotvec(target_pose[3:])
+            obs_rot = Rotation.from_rotvec(obs_pose[3:])
+            rot_norm = float(np.linalg.norm((target_rot * obs_rot.inv()).as_rotvec()))
             logging.info(
                 f"[{prefix}] absolute EE delta pos_norm={pos_norm:.6f}, rot_norm={rot_norm:.6f}"
             )
