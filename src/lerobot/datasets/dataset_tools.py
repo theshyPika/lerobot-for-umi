@@ -51,6 +51,7 @@ from .io_utils import (
     load_episodes,
     write_info,
     write_stats,
+    write_subtasks,
     write_tasks,
 )
 from .lerobot_dataset import LeRobotDataset
@@ -137,6 +138,10 @@ def delete_episodes(
     data_metadata = _copy_and_reindex_data(dataset, new_meta, episode_mapping)
 
     _copy_and_reindex_episodes_metadata(dataset, new_meta, episode_mapping, data_metadata, video_metadata)
+
+    if dataset.meta.subtasks is not None:
+        new_meta.subtasks = dataset.meta.subtasks.copy()
+        write_subtasks(new_meta.subtasks, new_meta.root)
 
     new_dataset = LeRobotDataset(
         repo_id=repo_id,
@@ -909,7 +914,8 @@ def _copy_and_reindex_episodes_metadata(
 
     logging.info(f"Aggregating statistics for {len(all_stats)} episodes")
     aggregated_stats = aggregate_stats(all_stats)
-    filtered_stats = {k: v for k, v in aggregated_stats.items() if k in dst_meta.features}
+    meta_keys = {"index", "episode_index", "task_index", "subtask_index", "frame_index", "timestamp"}
+    filtered_stats = {k: v for k, v in aggregated_stats.items() if k in dst_meta.features and k not in meta_keys}
     write_stats(filtered_stats, dst_meta.root)
 
 
@@ -1561,7 +1567,7 @@ def recompute_stats(
         The same dataset with updated stats.
     """
     features = dataset.meta.features
-    meta_keys = {"index", "episode_index", "task_index", "frame_index", "timestamp"}
+    meta_keys = {"index", "episode_index", "task_index", "subtask_index", "frame_index", "timestamp"}
     numeric_features = {
         k: v
         for k, v in features.items()
@@ -1630,7 +1636,7 @@ def recompute_stats(
     # Merge: keep existing stats for features we didn't recompute
     if dataset.meta.stats:
         for key, value in dataset.meta.stats.items():
-            if key not in new_stats:
+            if key not in new_stats and key not in meta_keys:
                 new_stats[key] = value
 
     write_stats(new_stats, dataset.root)
