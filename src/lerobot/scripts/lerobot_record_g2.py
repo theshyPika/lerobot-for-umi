@@ -181,7 +181,7 @@ class DatasetRecordConfig:
     # Limit the frames per second.
     fps: int = 30
     # Number of seconds for data recording for each episode.
-    episode_time_s: int | float = 90
+    episode_time_s: int | float = 180
     # Number of seconds for resetting the environment after each episode.
     reset_time_s: int | float = 60
     # Number of episodes to record.
@@ -251,7 +251,7 @@ class RecordConfig:
     resume: bool = False
     # Action interpolation multiplier for smoother policy control (1=off, 2=2x, 3=3x)
     # Only applies when using a policy (not teleop)
-    interpolation_multiplier: int = 1
+    interpolation_multiplier: int = 2
     # Frame used for G2 end-effector observation/action poses. Use "world" for old base/world mode.
     ee_reference_frame: str | None = "arm_base_link"
     # Prefer placo's native relative frame task when ee_reference_frame is set.
@@ -387,7 +387,11 @@ def record_loop(
     use_interpolation = interpolator is not None and interpolator.enabled and policy is not None
     control_interval = interpolator.get_control_interval(fps) if interpolator else 1 / fps
     # Pre-compute action key order outside the hot loop — it won't change mid-episode.
-    action_keys = sorted(robot.action_features) if use_interpolation else []
+    # Note: robot.action_features returns EE pose keys (e.g., l.ee.x, l.ee.gripper.pos),
+    # but robot_action_processor (IK) converts these to joint keys (e.g., l.joint1.pos, l.gripper.pos).
+    # Use motor-based keys for interpolation to match the processor output.
+    # action_keys = sorted(robot.action_features) if use_interpolation else []  # origin
+    action_keys = sorted([f"{m}.pos" for m in robot.motors]) if use_interpolation else []
 
     no_action_count = 0
     timestamp = 0
@@ -465,7 +469,10 @@ def record_loop(
                 interp_action = interpolator.get()
                 if interp_action is not None:
                     robot_action_to_send = {k: interp_action[i].item() for i, k in enumerate(action_keys)}
-                    action_values = robot_action_to_send
+                    # Keep action_values in EE space (policy output) for dataset saving,
+                    # while robot_action_to_send uses joint space (after IK processing).
+                    if ran_inference:
+                        action_values = act_processed_policy  # preserve EE policy output for dataset
                 else:
                     continue
 
