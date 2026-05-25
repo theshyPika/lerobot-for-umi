@@ -9,22 +9,21 @@ robot = agibot_gdk.Robot()
 time.sleep(2) # 等待机器人初始化
 
 def control_gripper():
-    # 控制夹爪开合
-    action = {
-    # "left_ee_state": {
-    # "joint_position": 0.5,
-    # },
-    "right_ee_state": {
-    "joint_position": 0.5,
-    }
-    }
-    # 左手夹爪位置
-    # 右手夹爪位置
+    # 控制左夹爪（omnipicker类型，需要1个关节）
+    joint_states_left = agibot_gdk.JointStates()
+    joint_states_left.group = "right_tool"
+    joint_states_left.target_type = "omnipicker"
+
+    joint_state = agibot_gdk.JointState()
+    joint_state.position = 0  # 取值范围 [-0.785, 0]  
+    joint_states_left.states = [joint_state]
+    joint_states_left.nums = len(joint_states_left.states)
+
     try:
-        result = robot.move_ee_pos(action)
-        print("夹爪控制成功")
+        result = robot.move_ee_pos(joint_states_left)
+        print("左夹爪控制成功")
     except Exception as e:
-        print(f"夹爪控制失败: {e}")
+        print(f"左夹爪控制失败: {e}")
 
 def control_gripper2():
     # # 控制左夹爪（omnipicker类型，需要1个关节）
@@ -75,4 +74,4 @@ def control_arm():
 if __name__ == "__main__":
     control_gripper()
     # control_gripper2()
-    control_arm()
+    # control_arm()

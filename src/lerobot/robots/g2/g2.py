@@ -17,11 +17,15 @@ from ..robot import Robot
 from .config_g2 import G2RobotConfig
 from .config_gripper import DHGripper
 from .g2_constants import (
+    ARM_JOINT_MAPPING,
     FULL_JOINT_POSITIONS_OBS_KEY,
+    G2_GRIPPER_JOINT_NAMES,
     GRIPPER_COMMAND_MIN_DELTA,
     LEFT_ARM_JOINT_NAMES,
     RAD_TO_DEG,
     RIGHT_ARM_JOINT_NAMES,
+    g2_gripper_normalized_to_rad,
+    g2_gripper_rad_to_normalized,
 )
 
 logger = logging.getLogger(__name__)
@@ -556,46 +560,53 @@ class G2Robot(Robot):
                 joint_values_deg = list(right_deg) + [0.0]
 
             gripper_config = self.config.gripper_config
-            if self.config.dual_arm:
-                for arm, j_idx in (("left", 7), ("right", 15)):
-                    if arm not in gripper_config:
-                        continue
-                    if gripper_config[arm].get("type", "g2") == "g2":
-                        joint_values_deg[j_idx]=self._last_gripper_positions.get(arm)
-                    elif gripper_config[arm].get("type", "g2") == "dh":
-                        try:
-                            gripper = self.grippers.get(arm)
-                            if gripper and hasattr(gripper, "get_position"):
-                                gcfg = gripper_config[arm]
-                                open_pos = gcfg.get("open_position", 1000)
-                                close_pos = gcfg.get("close_position", 0)
-                                if open_pos != close_pos:
-                                    raw = gripper.get_position()
-                                    joint_values_deg[j_idx] = float(
-                                        (raw - close_pos) / (open_pos - close_pos)
-                                    )
-                        except Exception as e:
-                            logger.warning("获取%s臂夹爪位置失败: %s", arm, e)
-            else:
-                arm_side = "left" if self.config.use_left_arm else "right"
-                if arm_side in gripper_config and gripper_config[arm_side].get("type", "g2") == "dh":
-                    joint_values_deg[-1] = self._last_gripper_positions.get(arm_side)
-                else:
+
+            def _read_gripper_normalized(arm: str) -> float | None:
+                """Return normalized [0, 1] gripper observation, matching action convention.
+
+                Falls back to the last commanded value if the SDK joint angle is unavailable.
+                """
+                cfg = gripper_config.get(arm)
+                if cfg is None:
+                    return None
+                g_type = cfg.get("type", "g2")
+                if g_type == "g2":
+                    # Read true omnipicker joint angle from SDK joint state and
+                    # convert back to normalized [0, 1] (0 = open, 1 = closed).
+                    gdk_name = G2_GRIPPER_JOINT_NAMES.get(arm)
+                    if gdk_name and gdk_name in joint_positions_by_name:
+                        return float(
+                            g2_gripper_rad_to_normalized(joint_positions_by_name[gdk_name])
+                        )
+                    last = self._last_gripper_positions.get(arm)
+                    return float(last) if last is not None else 0.0
+                if g_type == "dh":
                     try:
-                        gripper = self.grippers.get(arm_side)
+                        gripper = self.grippers.get(arm)
                         if gripper and hasattr(gripper, "get_position"):
-                            gcfg = gripper_config[arm_side]
-                            open_pos = gcfg.get("open_position", 1000)
-                            close_pos = gcfg.get("close_position", 0)
+                            open_pos = cfg.get("open_position", 1000)
+                            close_pos = cfg.get("close_position", 0)
                             if open_pos != close_pos:
                                 raw = gripper.get_position()
-                                joint_values_deg[-1] = float(
-                                    (raw - close_pos) / (open_pos - close_pos)
-                                )
+                                return float((raw - close_pos) / (open_pos - close_pos))
                     except Exception as e:
-                        logger.warning("获取%s臂夹爪位置失败: %s", arm_side, e)
+                        logger.warning("获取%s臂夹爪位置失败: %s", arm, e)
+                    last = self._last_gripper_positions.get(arm)
+                    return float(last) if last is not None else 0.0
+                return None
+
+            if self.config.dual_arm:
+                for arm, j_idx in (("left", 7), ("right", 15)):
+                    value = _read_gripper_normalized(arm)
+                    if value is not None:
+                        joint_values_deg[j_idx] = value
+            else:
+                arm_side = "left" if self.config.use_left_arm else "right"
+                value = _read_gripper_normalized(arm_side)
+                if value is not None:
+                    joint_values_deg[-1] = value
             # logger.info(f"joint_values_deg' len: {len(joint_values_deg)}")
-            logger.info(f"joint keys : {joint_keys}")
+            logger.debug(f"joint keys : {joint_keys}")
             for k, v in zip(joint_keys, joint_values_deg, strict=True):
                 obs[k] = float(v)
                 # 更新当前关节角度存储
@@ -608,11 +619,24 @@ class G2Robot(Robot):
             for k in joint_keys:
                 obs[k] = 0.0
 
+        # TODO(g2-frame-refactor): GDK 返回的是底盘/世界系 EE pose，但下游 policy / IK
+        # 都期望 arm_base_link（胸腔）系，所以目前在外层套了一个
+        # ForwardKinematicsJointsToEEObservationG2 做帧覆写，造成 "raw vs processed"
+        # 二元性并引发了一系列 bug（见 plan hashed-roaming-riddle.md）。
+        # 后续重构方向：
+        #   1) G2RobotConfig 增加 urdf_path / left_ee_target_frame /
+        #      right_ee_target_frame / ee_reference_frame / ee_tcp_offset /
+        #      use_relative_frame_task 字段
+        #   2) G2Robot.connect() 实例化 lerobot.model.kinematics.DualArmKinematics
+        #   3) 这一段改成 self._fk_kinematics.forward_kinematics(joint_positions_by_name)
+        #      直接返回 arm_base_link 系 EE
+        #   4) 删除 rollout / record 脚本里的 fk_solver 和
+        #      ForwardKinematicsJointsToEEObservationG2
         try:
             t_ee_start = time.perf_counter()
             current_poses = self.get_end_effector_pose()
             t_ee_end = time.perf_counter()
-            logger.info(f"get_end_effector_pose took {(t_ee_end - t_ee_start) * 1000:.2f} ms")
+            logger.debug(f"get_end_effector_pose took {(t_ee_end - t_ee_start) * 1000:.2f} ms")
             if self.config.dual_arm:
                 if len(current_poses) >= 2:
                     lp, rp = current_poses[0], current_poses[1]
@@ -669,7 +693,7 @@ class G2Robot(Robot):
                 ]
             else:
                 ee_vals = [0.0] * len(ee_keys)
-            logger.info(f"current_poses:{ee_vals}")
+            logger.debug(f"current_poses:{ee_vals}")
             for k, v in zip(ee_keys, ee_vals, strict=True):
                 obs[k] = float(v)
         except Exception as e:
@@ -703,7 +727,7 @@ class G2Robot(Robot):
         
         Includes activation check for joint control.
         """
-        logger.info(f"Sending action: {action}")
+        logger.debug(f"Sending action: {action}")
         t_start = time.perf_counter()
 
         if not self._is_connected:
@@ -714,101 +738,115 @@ class G2Robot(Robot):
         t_activation_start = time.perf_counter()
         left_active, right_active = self._get_joint_activation(action)
         t_activation_end = time.perf_counter()
-        logger.info(f"_get_joint_activation took {(t_activation_end - t_activation_start) * 1000:.2f} ms")
+        logger.debug(f"_get_joint_activation took {(t_activation_end - t_activation_start) * 1000:.2f} ms")
 
         try:
-            # Control joints based on action (only if activated)
-            if left_active or right_active:
-                t_joint_start = time.perf_counter()
-                self._control_joints(action)
-                t_joint_end = time.perf_counter()
-                logger.info(f"_control_joints took {(t_joint_end - t_joint_start) * 1000:.2f} ms")
+            # Combined servo control: arm joints + G2 omnipicker grippers travel in one
+            # ``joint_servo_control`` request. ``_send_servo_control`` internally skips
+            # arms whose target equals the current position (per activation flags) and
+            # gripper joints with sub-threshold deltas.
+            t_servo_start = time.perf_counter()
+            self._send_servo_control(action, left_active, right_active)
+            t_servo_end = time.perf_counter()
+            logger.debug(f"_send_servo_control took {(t_servo_end - t_servo_start) * 1000:.2f} ms")
 
-            # Control grippers based on action
+            # DH grippers use a separate serial-bus interface and are not multiplexed
+            # onto joint_servo_control.
             t_gripper_start = time.perf_counter()
             self._control_grippers_from_action(action)
             t_gripper_end = time.perf_counter()
-            logger.info(f"_control_grippers_from_action took {(t_gripper_end - t_gripper_start) * 1000:.2f} ms")
+            logger.debug(f"_control_grippers_from_action took {(t_gripper_end - t_gripper_start) * 1000:.2f} ms")
 
         except Exception as e:
             logger.error(f"Failed to send action: {e}")
 
         t_end = time.perf_counter()
-        logger.info(f"send_action total took {(t_end - t_start) * 1000:.2f} ms")
+        logger.debug(f"send_action total took {(t_end - t_start) * 1000:.2f} ms")
 
         return action
 
-    def _control_joints(self, action: RobotAction) -> None:
-        """Control robot joints based on action dictionary.
-        
-        Action keys expected: '{l|r}.joint{1-7}.pos' (degrees)
-        Converts to radians and sends via GDK joint_control_request.
+    def _send_servo_control(
+        self, action: RobotAction, left_active: bool, right_active: bool
+    ) -> None:
+        """Send arm joints + G2 omnipicker grippers via GDK ``joint_servo_control``.
+
+        Arm joint positions in ``action`` are in degrees and converted to radians here.
+        G2 gripper positions are passed through (expected in radians, omnipicker range
+        [-0.785, 0]) and gated by ``GRIPPER_COMMAND_MIN_DELTA``. DH grippers are handled
+        separately via the existing serial-bus path.
         """
         if not self._agibot_gdk or not self.robot:
-            logger.warning("GDK not initialized, skipping joint control")
+            logger.warning("GDK not initialized, skipping servo control")
             return
-        
-        # Map joint names from action keys to GDK joint names
-        joint_mapping = {
-            'l.joint1.pos': 'idx21_arm_l_joint1',
-            'l.joint2.pos': 'idx22_arm_l_joint2',
-            'l.joint3.pos': 'idx23_arm_l_joint3',
-            'l.joint4.pos': 'idx24_arm_l_joint4',
-            'l.joint5.pos': 'idx25_arm_l_joint5',
-            'l.joint6.pos': 'idx26_arm_l_joint6',
-            'l.joint7.pos': 'idx27_arm_l_joint7',
-            'r.joint1.pos': 'idx61_arm_r_joint1',
-            'r.joint2.pos': 'idx62_arm_r_joint2',
-            'r.joint3.pos': 'idx63_arm_r_joint3',
-            'r.joint4.pos': 'idx64_arm_r_joint4',
-            'r.joint5.pos': 'idx65_arm_r_joint5',
-            'r.joint6.pos': 'idx66_arm_r_joint6',
-            'r.joint7.pos': 'idx67_arm_r_joint7',
-        }
-        
-        # Collect joints to control based on configuration
-        joints_to_control = []
-        
+
+        joint_names: list[str] = []
+        joint_positions: list[float] = []
+
+        # Arm joints — only send for arms whose target diverged from current state.
         if self.config.dual_arm:
-            # Dual-arm: control both arms if joints present in action
-            arm_prefixes = ['l', 'r']
+            arm_prefixes = [p for p, a in (("l", left_active), ("r", right_active)) if a]
         else:
-            # Single-arm: control only configured arm
-            arm_prefixes = [self.config.single_arm_prefix]
-        
+            prefix = self.config.single_arm_prefix
+            arm_active = left_active if prefix == "l" else right_active
+            arm_prefixes = [prefix] if arm_active else []
+
         for prefix in arm_prefixes:
             for joint_num in range(1, 8):
                 key = f"{prefix}.joint{joint_num}.pos"
-                if key in action:
-                    gdk_joint_name = joint_mapping.get(key)
-                    if gdk_joint_name:
-                        joints_to_control.append((gdk_joint_name, action[key]))
-        
-        if not joints_to_control:
-            logger.debug("No joint positions found in action")
+                if key not in action:
+                    continue
+                gdk_name = ARM_JOINT_MAPPING.get(key)
+                if gdk_name is None:
+                    continue
+                joint_names.append(gdk_name)
+                joint_positions.append(float(np.deg2rad(action[key])))
+
+        # G2 gripper joints — must travel in the same servo request as the arms.
+        if self.config.use_gripper:
+            gripper_config = self.config.gripper_config
+            for arm in ("left", "right"):
+                cfg = gripper_config.get(arm)
+                if cfg is None or cfg.get("type", "g2") != "g2":
+                    continue
+                prefix = "l" if arm == "left" else "r"
+                key = f"{prefix}.gripper.pos"
+                if key not in action:
+                    continue
+
+                # Action value is normalized [0, 1] (0 = open, 1 = closed) to stay
+                # consistent with the legacy move_ee_pos interface and fine-tuned
+                # policies. Convert to omnipicker joint radians here.
+                value = float(action[key])
+                last = self._last_gripper_positions.get(arm)
+                if last is not None and abs(value - last) < GRIPPER_COMMAND_MIN_DELTA:
+                    # Hold last commanded position to avoid jitter near the deadband.
+                    value = float(last)
+                else:
+                    self._last_gripper_positions[arm] = value
+
+                joint_names.append(G2_GRIPPER_JOINT_NAMES[arm])
+                joint_positions.append(g2_gripper_normalized_to_rad(value))
+
+        if not joint_names:
+            logger.debug("No joints to send via joint_servo_control")
             return
-        
+
         try:
-            # Create joint control request
-            joint_control_req = self._agibot_gdk.JointControlReq()
-            joint_control_req.joint_names = [name for name, _ in joints_to_control]
-            
-            # Convert degrees to radians for GDK
-            joint_control_req.joint_positions = [
-                np.deg2rad(pos) for _, pos in joints_to_control
-            ]
-            
-            # Set default velocity (0.1 rad/s) and lifetime (5.0s)
-            joint_control_req.joint_velocities = [0.4] * len(joints_to_control)
-            joint_control_req.life_time = 0.01
-            joint_control_req.detail = "Joint control from LeRobot"
-            
-            # Send control request
-            result = self.robot.joint_control_request(joint_control_req)
-            logger.info(f"Joint control sent for {len(joints_to_control)} joints, result: {result}")
-            
+            req = self._agibot_gdk.JointServoControlReq()
+            req.control_period = float(self.config.servo_control_period)
+            req.joint_names = joint_names
+            req.joint_positions = joint_positions
+
+            if self.config.servo_low_latency:
+                result = self.robot.joint_servo_control(req, enable_low_latency=True)
+            else:
+                result = self.robot.joint_servo_control(req)
+            logger.debug(
+                f"joint_servo_control sent {len(joint_names)} joints "
+                f"(period={req.control_period:.3f}s), result: {result}"
+            )
         except Exception as e:
-            logger.error(f"Joint control failed: {e}")
+            logger.error(f"joint_servo_control failed: {e}", exc_info=True)
 
     def _get_joint_activation(self, action: RobotAction) -> tuple[bool, bool]:
         """Get activation status for joint control by comparing target and current positions.
@@ -882,85 +920,52 @@ class G2Robot(Robot):
 
     
     def _control_grippers(self, action: dict[str, Any]):
-        """根据配置控制夹爪，添加位置缓存、变化检测和线程安全"""
-        
+        """控制 DH 夹爪。G2 omnipicker 已在 ``_send_servo_control`` 中与机械臂同步下发。"""
+
         # 检查机器人是否已连接，如果未连接则跳过夹爪控制
         if not self._is_connected:
             logger.debug("机器人未连接，跳过夹爪控制")
             return
-        
+
         gripper_config = self.config.gripper_config
-        
+
         for arm in ["left", "right"]:
             if arm not in gripper_config:
                 continue
-                
+
             config = gripper_config[arm]
             gripper_type = config.get("type", "g2")
-            
+
+            # G2 夹爪走 joint_servo_control 通道，这里只处理 DH 串口夹爪。
+            if gripper_type == "g2":
+                continue
+
             # 检查是否有该臂的夹爪控制信号
             gripper_key = f"{arm}_gripper"
             if gripper_key not in action:
                 continue
-                
+
             gripper_value = action[gripper_key]
-            
+
             # 检查位置变化是否超过阈值
             last_position = self._last_gripper_positions[arm]
             if last_position is not None and abs(gripper_value - last_position) < GRIPPER_COMMAND_MIN_DELTA:
                 # 位置变化小于阈值，跳过发送命令
                 logger.debug(f"{arm}臂夹爪位置变化小于阈值，跳过控制")
                 continue
-            
+
             # 更新位置缓存
             self._last_gripper_positions[arm] = gripper_value
-            
+
             # 检查错误计数，如果错误太多则跳过
             if self._gripper_error_count[arm] >= self._max_gripper_errors:
                 logger.warning(f"{arm}臂夹爪错误计数过多({self._gripper_error_count[arm]})，跳过控制")
                 continue
-            
-            # 根据夹爪类型进行控制
-            if gripper_type == "g2":
-                # 使用agibot_gdk控制G2夹爪
-                self._control_g2_gripper(arm, gripper_value, config)
-            elif gripper_type == "dh":
-                # 使用DHGripper控制
+
+            if gripper_type == "dh":
                 self._control_dh_gripper(arm, gripper_value, config)
             else:
                 logger.warning(f"{arm}臂未知夹爪类型: {gripper_type}")
-    
-    def _control_g2_gripper(self, arm: str, gripper_value: float, config: dict):
-        """控制G2本体夹爪"""
-        try:
-            # 根据错误信息，move_ee_pos可能期望同时有left_ee_state和right_ee_state
-            # 即使只控制一侧，也需要提供完整的末端执行器状态
-            action = {
-                "left_ee_state": {
-                    "joint_position": 0.0,  # 默认值
-                },
-                "right_ee_state": {
-                    "joint_position": 0.0,  # 默认值
-                }
-            }
-            
-            # 设置要控制的臂的位置
-            if arm == "left":
-                action["left_ee_state"]["joint_position"] = gripper_value
-            else:  # right
-                action["right_ee_state"]["joint_position"] = gripper_value
-            
-            # 调用agibot_gdk的夹爪控制接口
-            result = self.robot.move_ee_pos(action)
-            logger.info(f"{arm}臂G2夹爪控制: 位置={gripper_value}, 结果={result}")
-            
-            # 如果成功，重置错误计数
-            self._gripper_error_count[arm] = 0
-            
-        except Exception as e:
-            logger.error(f"{arm}臂G2夹爪控制失败: {e}")
-            # 增加错误计数
-            self._gripper_error_count[arm] = self._gripper_error_count.get(arm, 0) + 1
 
     def _control_dh_gripper(self, arm: str, gripper_value: float, config: dict):
         """控制DH夹爪 - 修复超时问题"""

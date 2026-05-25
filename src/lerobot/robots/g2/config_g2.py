@@ -70,6 +70,12 @@ class G2RobotConfig(RobotConfig):
 
     # Timestep (s) when interpolating toward default_positions if joint motion API is added.
     reset_control_dt: float = 1.0 / 30.0
+
+    # joint_servo_control parameters. control_period should be slightly larger than the host
+    # call period (1/fps). enable_low_latency removes collision protection — only enable when
+    # the upstream policy is verified safe.
+    servo_control_period: float = 0.04
+    servo_low_latency: bool = False
     
     @property
     def dual_arm(self) -> bool:
