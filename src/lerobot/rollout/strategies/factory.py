@@ -19,10 +19,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from .base import BaseStrategy
+from .base_panic import BasePanicStrategy
 from .core import RolloutStrategy
 from .dagger import DAggerStrategy
 from .highlight import HighlightStrategy
+from .highlight_panic import HighlightPanicStrategy
 from .sentry import SentryStrategy
+from .sentry_panic import SentryPanicStrategy
 
 if TYPE_CHECKING:
     from ..configs import RolloutStrategyConfig
@@ -34,12 +37,24 @@ def create_strategy(config: RolloutStrategyConfig) -> RolloutStrategy:
     Dispatches on ``config.type`` (the name registered via
     ``draccus.ChoiceRegistry``).
     """
+    # ``base_panic`` extends ``base`` and ``sentry_panic`` extends ``sentry``;
+    # check the more specific types first so ``isinstance``-style dispatch on
+    # subclass works correctly.
+    if config.type == "base_panic":
+        return BasePanicStrategy(config)
     if config.type == "base":
         return BaseStrategy(config)
+    if config.type == "sentry_panic":
+        return SentryPanicStrategy(config)
     if config.type == "sentry":
         return SentryStrategy(config)
+    if config.type == "highlight_panic":
+        return HighlightPanicStrategy(config)
     if config.type == "highlight":
         return HighlightStrategy(config)
     if config.type == "dagger":
         return DAggerStrategy(config)
-    raise ValueError(f"Unknown strategy type '{config.type}'. Available: base, sentry, highlight, dagger")
+    raise ValueError(
+        f"Unknown strategy type '{config.type}'. "
+        "Available: base, base_panic, sentry, sentry_panic, highlight, highlight_panic, dagger"
+    )

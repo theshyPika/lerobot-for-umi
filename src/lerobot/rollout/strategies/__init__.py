@@ -15,19 +15,25 @@
 """Rollout strategies — public API re-exports."""
 
 from .base import BaseStrategy
+from .base_panic import BasePanicStrategy
 from .core import RolloutStrategy, estimate_max_episode_seconds, safe_push_to_hub, send_next_action
 from .dagger import DAggerEvents, DAggerPhase, DAggerStrategy
 from .factory import create_strategy
 from .highlight import HighlightStrategy
+from .highlight_panic import HighlightPanicStrategy
 from .sentry import SentryStrategy
+from .sentry_panic import SentryPanicStrategy
 
 __all__ = [
+    "BasePanicStrategy",
     "BaseStrategy",
     "DAggerEvents",
     "DAggerPhase",
     "DAggerStrategy",
+    "HighlightPanicStrategy",
     "HighlightStrategy",
     "RolloutStrategy",
+    "SentryPanicStrategy",
     "SentryStrategy",
     "create_strategy",
     "estimate_max_episode_seconds",

@@ -58,6 +58,29 @@ class BaseStrategyConfig(RolloutStrategyConfig):
     pass
 
 
+@RolloutStrategyConfig.register_subclass("base_panic")
+@dataclass
+class BasePanicStrategyConfig(BaseStrategyConfig):
+    """Autonomous rollout with a human-triggered keyboard panic-pause.
+
+    A single keypress toggles between RUNNING and PAUSED:
+
+    * RUNNING — policy actions reach the robot as usual.
+    * PAUSED — the inference engine is paused; the strategy repeatedly
+      re-sends the last commanded robot action so the robot holds its
+      current pose without entering a servo-timeout.  Pressing the key
+      again clears the inference queue / policy state and resumes from
+      the current observation (so stale chunked actions never replay).
+
+    No data is recorded.  Use this strategy when you want a soft E-stop
+    during evaluation without having to wire a teleoperator.
+    """
+
+    # Keyboard key that toggles RUNNING ↔ PAUSED.  Single character (e.g.
+    # ``"p"``) or special key name (``"space"``, ``"tab"``).
+    panic_key: str = "space"
+
+
 @RolloutStrategyConfig.register_subclass("sentry")
 @dataclass
 class SentryStrategyConfig(RolloutStrategyConfig):
@@ -78,6 +101,46 @@ class SentryStrategyConfig(RolloutStrategyConfig):
     target_video_file_size_mb: int | None = None
 
 
+@RolloutStrategyConfig.register_subclass("sentry_panic")
+@dataclass
+class SentryPanicStrategyConfig(SentryStrategyConfig):
+    """Sentry recording with eval-friendly keyboard controls.
+
+    Same continuous-recording semantics as ``sentry`` plus a three-state
+    keyboard control surface tailored to policy evaluation:
+
+    * RUNNING — frames are recorded and policy actions reach the robot.
+    * PAUSED (``panic_key`` / space) — inference engine paused; no action
+      is sent to the robot so the arm is free to be hand-moved. Frames
+      are not recorded. Paused wall time is excluded from ``cfg.duration``.
+    * RESET (after ``→`` / ``←`` / size-rotation) — between-episode reset
+      window of ``reset_time_s`` seconds.  Robot is released (no actions
+      sent) so the operator can manually reset the scene.  Press ``n``
+      to skip the remaining reset time.
+
+    Keys are split to avoid the toggle ambiguity of a single key:
+
+    * ``panic_key`` (default space) — RUNNING → PAUSED.  No-op in PAUSED.
+    * ``n`` — PAUSED → RUNNING ("resume") or RESET → RUNNING ("continue").
+    * ``→`` (right arrow) — save the current episode and enter RESET.
+    * ``←`` (left arrow)  — discard the current episode buffer and
+      enter RESET (re-record).
+    * ``ESC`` — shutdown the rollout.
+    """
+
+    # Keyboard key that sends RUNNING → PAUSED.  Single character (e.g.
+    # ``"p"``) or special key name (``"space"``, ``"tab"``).  Resume uses
+    # the hardcoded ``n`` key.
+    panic_key: str = "space"
+    # Reset window between episodes (seconds).  During RESET the robot is
+    # released (no actions sent) so the operator can manually reset the
+    # scene/robot.  Press ``panic_key`` to skip the remaining reset time
+    # and start the next episode early.  Set to 0 to disable the reset
+    # window (preserves the pre-feature behaviour: save then immediately
+    # start the next episode).
+    reset_time_s: float = 0.0
+
+
 @RolloutStrategyConfig.register_subclass("highlight")
 @dataclass
 class HighlightStrategyConfig(RolloutStrategyConfig):
@@ -93,6 +156,32 @@ class HighlightStrategyConfig(RolloutStrategyConfig):
     ring_buffer_max_memory_mb: int = 1024
     save_key: str = "s"
     push_key: str = "h"
+
+
+@RolloutStrategyConfig.register_subclass("highlight_panic")
+@dataclass
+class HighlightPanicStrategyConfig(HighlightStrategyConfig):
+    """Highlight recording with a human-triggered keyboard panic-pause.
+
+    Same on-demand ring-buffer recording as :class:`HighlightStrategyConfig`
+    plus a third key that toggles RUNNING ↔ PAUSED.  In PAUSED:
+
+    * ``engine.pause()`` is called once on the falling edge.
+    * **No** action is sent to the robot every tick (unlike sentry_panic /
+      base_panic which re-send the last commanded action).  This frees
+      the robot so the operator can manually move it to a reset pose
+      between evaluation episodes.  Requires that the robot's servo
+      interface tolerates being silent for the pause duration.
+    * Frames are not added to the dataset or the ring buffer.
+
+    Pressing the panic key while a live recording is in progress first
+    saves the in-progress episode (clean boundary) and then enters PAUSED.
+
+    On resume the interpolator and engine are reset so stale chunked
+    actions never replay against the new starting pose.
+    """
+
+    panic_key: str = "space"
 
 
 @dataclass
@@ -181,7 +270,7 @@ class RolloutConfig:
     # Policy (loaded from --policy.path via __post_init__)
     policy: PreTrainedConfig | None = None
 
-    # Strategy (polymorphic: --strategy.type=base|sentry|highlight|dagger)
+    # Strategy (polymorphic: --strategy.type=base|base_panic|sentry|sentry_panic|highlight|highlight_panic|dagger)
     strategy: RolloutStrategyConfig = field(default_factory=BaseStrategyConfig)
 
     # Inference backend (polymorphic: --inference.type=sync|rtc)
@@ -213,7 +302,7 @@ class RolloutConfig:
     # When True (default), smoothly interpolate the robot back to the joint
     # positions captured at startup before disconnecting.  Set to False to
     # leave the robot in its final achieved pose at shutdown.
-    return_to_initial_position: bool = True
+    return_to_initial_position: bool = False #@ck TODO: back to init pos having error, due to wrong current_pos from robot.get_observation()
 
     # Torch compile
     use_torch_compile: bool = False

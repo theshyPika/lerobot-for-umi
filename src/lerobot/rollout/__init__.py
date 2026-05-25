@@ -19,6 +19,7 @@ from lerobot.utils.import_utils import require_package
 require_package("datasets", extra="dataset")
 
 from .configs import (
+    BasePanicStrategyConfig,
     BaseStrategyConfig,
     DAggerKeyboardConfig,
     DAggerPedalConfig,
@@ -47,6 +48,7 @@ from .inference import (
     create_inference_engine,
 )
 from .strategies import (
+    BasePanicStrategy,
     BaseStrategy,
     DAggerStrategy,
     HighlightStrategy,
@@ -56,6 +58,8 @@ from .strategies import (
 )
 
 __all__ = [
+    "BasePanicStrategy",
+    "BasePanicStrategyConfig",
     "BaseStrategy",
     "BaseStrategyConfig",
     "DAggerKeyboardConfig",
