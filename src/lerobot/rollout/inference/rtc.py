@@ -218,12 +218,22 @@ class RTCInferenceEngine(InferenceEngine):
 
     def reset(self) -> None:
         """Reset the policy, processors, and action queue."""
-        logger.info("Resetting RTC inference state (policy + processors + queue)")
+        logger.info("Resetting RTC inference state (policy + processors + queue + obs holder)")
         self._policy.reset()
         self._preprocessor.reset()
         self._postprocessor.reset()
         if self._action_queue is not None:
             self._action_queue.clear()
+        # Drop the stale obs cached before pause — otherwise the RTC thread
+        # races ``engine.resume()`` and runs one inference against the pre-pause
+        # observation, producing a chunk whose absolute targets are anchored to
+        # a state the robot no longer has after a manual reset.
+        with self._obs_lock:
+            self._obs_holder["obs"] = None
+        # Same risk for the relative-action reference state — clear it so the
+        # next preprocess pass rebuilds it from the fresh observation.
+        if self._relative_step is not None:
+            self._relative_step._last_state = None
 
     # ------------------------------------------------------------------
     # Action production (called from main thread)

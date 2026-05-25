@@ -269,19 +269,27 @@ def build_rollout_context(
     #         )
 
     # --- 4. Features + action-key reconciliation ---------------------
-    # TODO(Steven):Only ``.pos`` joint features are routed to the policy as state and as the
-    # action target; velocity and torque channels (when present) are kept in
-    # the raw observation but excluded from the policy-facing tensors.
+    # Position-like scalar channels are routed to the policy as state / action
+    # target; velocity and torque channels (when present, e.g. openarm) stay in
+    # the raw observation but are excluded from the policy-facing tensors.
+    # Denylist (rather than ".pos" allowlist) so EE-space robots whose action
+    # keys are ".x/.y/.z/.wx/.wy/.wz/.gripper.pos" (e.g. G2) are also accepted.
     all_obs_features = robot.observation_features
+
+    def _is_position_scalar(key: str, ftype) -> bool:
+        return ftype is float and not key.endswith((".vel", ".torque", ".eff"))
+
     # ``observation_features`` values are either a tuple (camera shape) or the
     # ``float`` type itself used as a sentinel for scalar motor features —
     # see ``dict[str, type | tuple]`` annotation on ``Robot.observation_features``.
     observation_features_hw = {
         k: v
         for k, v in all_obs_features.items()
-        if isinstance(v, tuple) or (v is float and k.endswith(".pos"))
+        if isinstance(v, tuple) or _is_position_scalar(k, v)
     }
-    action_features_hw = {k: v for k, v in robot.action_features.items() if k.endswith(".pos")}
+    action_features_hw = {
+        k: v for k, v in robot.action_features.items() if _is_position_scalar(k, v)
+    }
 
     # The action side is always needed: sync inference reads action names from
     # ``dataset_features[ACTION]`` to map policy tensors back to robot actions.

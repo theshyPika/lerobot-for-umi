@@ -299,6 +299,12 @@ def send_next_action(
     if len(interp) != len(ordered_keys):
         raise ValueError(f"Interpolated tensor length ({len(interp)}) != action keys ({len(ordered_keys)})")
     action_dict = {k: interp[i].item() for i, k in enumerate(ordered_keys)}
-    processed = ctx.processors.robot_action_processor((action_dict, obs_raw))
+    # TODO(g2-frame-refactor): pass obs_processed (not obs_raw) so the action processor
+    # sees EE poses in the same frame as the policy's action (e.g. arm_base_link for G2
+    # via ForwardKinematicsJointsToEEObservationG2). The proper fix is to have
+    # G2Robot.get_observation() return arm_base_link-frame EE directly, after which
+    # raw/processed observations would be identical and obs_raw could be removed.
+    # See plan hashed-roaming-riddle.md.
+    processed = ctx.processors.robot_action_processor((action_dict, obs_processed))
     ctx.hardware.robot_wrapper.send_action(processed)
     return action_dict
