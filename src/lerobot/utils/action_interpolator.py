@@ -23,6 +23,8 @@ import math
 import torch
 from torch import Tensor
 
+from lerobot.utils.rotation import quat_slerp
+
 # temp fix @ck
 def detect_rotvec_indices_from_keys(action_keys: list[str]) -> list[tuple[int, int, int]]:
     """Detect axis-angle (``wx``/``wy``/``wz``) rotvec triplets in an action key list.
@@ -98,36 +100,46 @@ class ActionInterpolator:
             robot.send_action(action)
 
     Rotation handling:
-        When the action vector contains rotvec (axis-angle) columns,
-        component-wise linear interpolation is geometrically incorrect near
-        ``‖r‖ = π``: two adjacent actions can be antipodal twins of the same
-        rotation but lie ~``2π`` apart as 3-vectors, so the blend sweeps through
-        identity and the gripper tumbles. Pass ``rotation_indices`` to align each
-        rotvec triplet to ``_prev`` before linear interpolation; this gives the
-        geometric short path without changing anything for other columns.
-        The companion helper :func:`detect_rotvec_indices_from_keys` infers the
-        triplets from the action key naming convention.
+        Component-wise linear interpolation is geometrically wrong for orientation
+        columns. Two cases are handled:
+
+        - rotvec (axis-angle) columns via ``rotation_indices``: near ``‖r‖ = π`` two
+          adjacent actions can be antipodal twins of the same rotation but lie
+          ~``2π`` apart as 3-vectors, so the blend sweeps through identity and the
+          gripper tumbles. Each triplet is aligned to ``_prev`` (antipodal-twin
+          pick) before the linear blend.
+        - quaternion columns via ``quaternion_indices``: each quadruplet is
+          interpolated with SLERP along the shortest arc instead of linearly.
+
+        Other columns (position, gripper) keep plain linear interpolation. The
+        companion helpers :func:`detect_rotvec_indices_from_keys` and
+        ``detect_quaternion_indices_from_names`` infer the index groups from the
+        action key naming convention.
     """
 
     def __init__(
         self,
         multiplier: int = 1,
         rotation_indices: list[tuple[int, int, int]] | None = None,
+        quaternion_indices: list[tuple[int, int, int, int]] | None = None,
     ):
         """Initialize the interpolator.
 
         Args:
             multiplier: Control rate multiplier (1 = no interpolation, 2 = 2x, 3 = 3x, etc.)
-            rotation_indices: Optional list of ``(idx_wx, idx_wy, idx_wz)`` index
-                triplets specifying rotvec columns of the action vector. Each
-                triplet is aligned against ``_prev`` (antipodal-twin pick) before
-                the linear interpolation step. ``None`` (default) keeps the pure
-                linear behaviour.
+            rotation_indices: Optional list of ``(idx_wx, idx_wy, idx_wz)`` rotvec
+                triplets. Each is aligned against ``_prev`` (antipodal-twin pick)
+                before the linear interpolation step. For rotvec-encoded actions.
+            quaternion_indices: Optional list of ``(idx_qx, idx_qy, idx_qz, idx_qw)``
+                quaternion quadruplets. Each is interpolated with SLERP (shortest
+                arc) between ``_prev`` and the new action instead of linearly. For
+                quaternion-encoded actions. ``None``/empty keeps pure linear blending.
         """
         if multiplier < 1:
             raise ValueError(f"multiplier must be >= 1, got {multiplier}")
         self.multiplier = multiplier
         self.rotation_indices: list[tuple[int, int, int]] = list(rotation_indices or [])
+        self.quaternion_indices: list[tuple[int, int, int, int]] = list(quaternion_indices or [])
         self._prev: Tensor | None = None
         self._buffer: list[Tensor] = []
         self._idx = 0
@@ -173,6 +185,11 @@ class ActionInterpolator:
             for i in range(1, self.multiplier + 1):
                 t = i / self.multiplier
                 interp = self._prev + t * (action - self._prev)
+                # Quaternion columns: replace the (wrong) linear blend with SLERP
+                # along the shortest arc between the previous and new orientation.
+                for iqx, iqy, iqz, iqw in self.quaternion_indices:
+                    idx = [iqx, iqy, iqz, iqw]
+                    interp[idx] = quat_slerp(self._prev[idx], action[idx], t)
                 self._buffer.append(interp)
         else:
             # First step: no previous action yet, so run at base FPS without interpolation.

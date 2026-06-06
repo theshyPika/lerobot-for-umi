@@ -22,6 +22,7 @@ import time
 from typing import TYPE_CHECKING
 
 from lerobot.datasets.utils import DEFAULT_VIDEO_FILE_SIZE_IN_MB
+from lerobot.processor.relative_action_processor import detect_quaternion_indices_from_names
 from lerobot.utils.action_interpolator import ActionInterpolator, detect_rotvec_indices_from_keys
 from lerobot.utils.constants import OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame
@@ -60,21 +61,28 @@ class RolloutStrategy(abc.ABC):
         Call this from ``setup()`` so strategies share identical
         initialisation without duplicating code.
         """
-        # temp fix @ck
-        # Auto-detect rotvec column triplets (``*.wx``/``.wy``/``.wz``) from the
-        # ordered action keys so the interpolator can pick the geometric short
-        # path for each rotation instead of linearly blending across the
-        # rotvec antipodal-twin discontinuity.
+        # Auto-detect orientation columns from the ordered action keys so the
+        # interpolator can interpolate rotations geometrically (shortest arc)
+        # instead of linearly. Datasets use either rotvec (``*.wx/.wy/.wz``) or
+        # quaternion (``*.qx/.qy/.qz/.qw``) EE orientation; only one is non-empty.
         rotation_indices = detect_rotvec_indices_from_keys(ctx.data.ordered_action_keys)
+        quaternion_indices = detect_quaternion_indices_from_names(ctx.data.ordered_action_keys)
         if rotation_indices:
             logger.info(
-                "ActionInterpolator: detected %d rotvec column triplet(s) for alignment: %s",
+                "ActionInterpolator: detected %d rotvec triplet(s) for antipodal alignment: %s",
                 len(rotation_indices),
                 rotation_indices,
+            )
+        if quaternion_indices:
+            logger.info(
+                "ActionInterpolator: detected %d quaternion quadruplet(s) for SLERP: %s",
+                len(quaternion_indices),
+                quaternion_indices,
             )
         self._interpolator = ActionInterpolator(
             multiplier=ctx.runtime.cfg.interpolation_multiplier,
             rotation_indices=rotation_indices,
+            quaternion_indices=quaternion_indices,
         )
         self._engine = ctx.policy.inference
         logger.info("Starting inference engine...")

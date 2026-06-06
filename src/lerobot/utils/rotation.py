@@ -310,3 +310,29 @@ def quat_normalize(q: Tensor, eps: float = 1e-8) -> Tensor:
 def quat_canonicalize(q: Tensor) -> Tensor:
     """Force ``qw >= 0`` so a rotation uses its short-arc representation."""
     return torch.where(q[..., 3:4] < 0, -q, q)
+
+
+def quat_slerp(q0: Tensor, q1: Tensor, t: float | Tensor) -> Tensor:
+    """Spherical linear interpolation between unit xyzw quaternions.
+
+    Interpolates along the shortest arc (sign-aligning ``q1`` to ``q0`` first), so it
+    never sweeps through identity the way component-wise linear blending of two
+    antipodal-twin representations would. Falls back to normalized linear (nlerp)
+    when the two rotations are nearly identical to avoid division by ~0.
+
+    Args:
+        q0, q1: ``(..., 4)`` quaternions (normalized internally).
+        t: interpolation fraction in [0, 1], scalar or broadcastable to ``(..., 1)``.
+    """
+    q0 = quat_normalize(q0)
+    q1 = quat_normalize(q1)
+    dot = (q0 * q1).sum(dim=-1, keepdim=True)
+    # Shortest path: flip q1 onto the same hemisphere as q0.
+    q1 = torch.where(dot < 0, -q1, q1)
+    dot = dot.abs().clamp(max=1.0)
+    theta = torch.arccos(dot)
+    sin_theta = torch.sin(theta)
+    slerp = (torch.sin((1.0 - t) * theta) * q0 + torch.sin(t * theta) * q1) / sin_theta.clamp_min(1e-8)
+    nlerp = quat_normalize((1.0 - t) * q0 + t * q1)
+    out = torch.where(sin_theta < 1e-6, nlerp, slerp)
+    return quat_normalize(out)
