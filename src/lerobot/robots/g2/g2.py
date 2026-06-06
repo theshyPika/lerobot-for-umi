@@ -11,8 +11,6 @@ import numpy as np
 
 from lerobot.motors.motors_bus import Motor
 from lerobot.types import RobotAction, RobotObservation
-from lerobot.utils.rotation import Rotation
-
 from ..robot import Robot
 from .config_g2 import G2RobotConfig
 from .config_gripper import DHGripper
@@ -149,42 +147,19 @@ class G2Robot(Robot):
         return {f"{motor}.pos" : float for motor in self.motors}    
 
     def _ee_observation_key_names(self) -> list[str]:
+        # EE orientation is a unit quaternion (xyzw); the arm_base_link-frame EE pose
+        # is produced by the FK observation processor, not by GDK. Per arm:
+        # 3 position + 4 quaternion + 1 gripper.
+        def arm_keys(p: str) -> list[str]:
+            return [
+                f"{p}.ee.x", f"{p}.ee.y", f"{p}.ee.z",
+                f"{p}.ee.qx", f"{p}.ee.qy", f"{p}.ee.qz", f"{p}.ee.qw",
+                f"{p}.ee.gripper.pos",
+            ]
+
         if self.config.dual_arm:
-            return [
-                "l.ee.x",
-                "l.ee.y",
-                "l.ee.z",
-                "l.ee.wx",
-                "l.ee.wy",
-                "l.ee.wz",
-                "l.ee.gripper.pos",
-                "r.ee.x",
-                "r.ee.y",
-                "r.ee.z",
-                "r.ee.wx",
-                "r.ee.wy",
-                "r.ee.wz",
-                "r.ee.gripper.pos"
-            ]
-        if self.config.use_left_arm:
-            return [
-                "l.ee.x",
-                "l.ee.y",
-                "l.ee.z",
-                "l.ee.wx",
-                "l.ee.wy",
-                "l.ee.wz",
-                "l.ee.gripper.pos"
-            ]
-        return [
-            "r.ee.x",
-            "r.ee.y",
-            "r.ee.z",
-            "r.ee.wx",
-            "r.ee.wy",
-            "r.ee.wz",
-            "r.ee.gripper.pos"
-        ]
+            return arm_keys("l") + arm_keys("r")
+        return arm_keys("l") if self.config.use_left_arm else arm_keys("r")
 
     def _ordered_state_scalar_keys(self) -> list[str]:
         # return self._joint_observation_key_names() + self._ee_observation_key_names() # option 1
@@ -538,13 +513,16 @@ class G2Robot(Robot):
             return np.zeros((480, 640, 3), dtype=np.uint8)
 
     def get_observation(self) -> RobotObservation:
-        """与 observation_features 键名一致的扁平观测（关节度 + 末端轴角位姿 + 相机 HWC uint8）。"""
+        """扁平观测：关节角(度) + 全身关节状态(供 FK) + 相机 HWC uint8。
+
+        末端位姿(l.ee.* / r.ee.*)由观测处理器中的 FK 步骤在 arm_base_link 系生成，
+        不在此处产出（GDK 返回的是底盘系，且会被覆盖）。
+        """
         if not self._is_connected:
             raise RuntimeError("Robot is not connected")
 
         obs: dict[str, Any] = {}
         joint_keys = self._motors_ft
-        ee_keys = self._ee_observation_key_names()
 
         try:
             joints_states = self.robot.get_joint_states()
@@ -633,87 +611,14 @@ class G2Robot(Robot):
             for k in joint_keys:
                 obs[k] = 0.0
 
-        # TODO(g2-frame-refactor): GDK 返回的是底盘/世界系 EE pose，但下游 policy / IK
-        # 都期望 arm_base_link（胸腔）系，所以目前在外层套了一个
-        # ForwardKinematicsJointsToEEObservationG2 做帧覆写，造成 "raw vs processed"
-        # 二元性并引发了一系列 bug（见 plan hashed-roaming-riddle.md）。
-        # 后续重构方向：
-        #   1) G2RobotConfig 增加 urdf_path / left_ee_target_frame /
-        #      right_ee_target_frame / ee_reference_frame / ee_tcp_offset /
-        #      use_relative_frame_task 字段
-        #   2) G2Robot.connect() 实例化 lerobot.model.kinematics.DualArmKinematics
-        #   3) 这一段改成 self._fk_kinematics.forward_kinematics(joint_positions_by_name)
-        #      直接返回 arm_base_link 系 EE
-        #   4) 删除 rollout / record 脚本里的 fk_solver 和
-        #      ForwardKinematicsJointsToEEObservationG2
-        try:
-            t_ee_start = time.perf_counter()
-            current_poses = self.get_end_effector_pose()
-            t_ee_end = time.perf_counter()
-            logger.debug(f"get_end_effector_pose took {(t_ee_end - t_ee_start) * 1000:.2f} ms")
-            if self.config.dual_arm:
-                if len(current_poses) >= 2:
-                    lp, rp = current_poses[0], current_poses[1]
-                    lq = np.array(
-                        [
-                            float(lp.orientation.x),
-                            float(lp.orientation.y),
-                            float(lp.orientation.z),
-                            float(lp.orientation.w),
-                        ]
-                    )
-                    rq = np.array(
-                        [
-                            float(rp.orientation.x),
-                            float(rp.orientation.y),
-                            float(rp.orientation.z),
-                            float(rp.orientation.w),
-                        ]
-                    )
-                    lv = Rotation.from_quat(lq).as_rotvec()
-                    rv = Rotation.from_quat(rq).as_rotvec()
-                    ee_vals = [
-                        float(lp.position.x),
-                        float(lp.position.y),
-                        float(lp.position.z),
-                        float(lv[0]),
-                        float(lv[1]),
-                        float(lv[2]),
-                        0.0, # TODO：add gripper values later
-                        float(rp.position.x),
-                        float(rp.position.y),
-                        float(rp.position.z),
-                        float(rv[0]),
-                        float(rv[1]),
-                        float(rv[2]),
-                        0.0,
-                    ]
-                else:
-                    ee_vals = [0.0] * len(ee_keys)
-            elif len(current_poses) >= 2:
-                p = current_poses[0] if self.config.use_left_arm else current_poses[1]
-                q = np.array(
-                    [float(p.orientation.x), float(p.orientation.y), float(p.orientation.z), float(p.orientation.w)]
-                )
-                v = Rotation.from_quat(q).as_rotvec()
-                ee_vals = [
-                    float(p.position.x),
-                    float(p.position.y),
-                    float(p.position.z),
-                    float(v[0]),
-                    float(v[1]),
-                    float(v[2]),
-                    0.0,
-                ]
-            else:
-                ee_vals = [0.0] * len(ee_keys)
-            logger.debug(f"current_poses:{ee_vals}")
-            for k, v in zip(ee_keys, ee_vals, strict=True):
-                obs[k] = float(v)
-        except Exception as e:
-            logger.warning("获取末端执行器位姿失败: %s", e)
-            for k in ee_keys:
-                obs[k] = 0.0
+        # NOTE: EE pose observations (l.ee.* / r.ee.*) are intentionally NOT produced
+        # here. GDK's get_end_effector_pose returns a chassis/world-frame pose, whereas
+        # the policy and IK operate in the arm_base_link frame. The arm_base_link EE
+        # pose (position + quaternion) is computed from the joint state by
+        # ForwardKinematicsJointsToEEObservationG2 in the observation processor, which
+        # also fills l.ee.gripper.pos from the joint gripper state. Fetching the GDK
+        # pose here was dead work (immediately overwritten) and added a blocking
+        # get_motion_control_status() call to every observation.
 
         for cam_name in self._enabled_camera_names():
             with self._locks[cam_name]:

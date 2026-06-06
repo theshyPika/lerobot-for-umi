@@ -436,8 +436,6 @@ def _build_g2_processors(cfg: RolloutConfigG2, motor_names: list[str]):
                 motor_names=motor_names,
                 kinematics=ik_solver,
                 initial_guess_current_joints=True,
-                # Policy outputs absolute EE targets in our G2 datasets.
-                use_relative_actions=False,
                 ee_hold_position_threshold_m=cfg.ee_hold_position_threshold_m,
                 ee_hold_rotation_threshold_rad=cfg.ee_hold_rotation_threshold_rad,
                 ik_position_weight=cfg.ik_position_weight,

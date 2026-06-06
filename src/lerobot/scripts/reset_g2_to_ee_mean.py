@@ -148,7 +148,6 @@ def reset(cfg: G2ResetConfig):
                 motor_names=list(robot.motors),
                 kinematics=kinematics_solver,
                 initial_guess_current_joints=True,
-                use_relative_actions=False,
                 ik_position_weight=1.0,
                 ik_orientation_weight=1.0,
             ),

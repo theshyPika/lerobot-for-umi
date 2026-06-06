@@ -624,43 +624,6 @@ class DualArmKinematics:
         for i, joint_name in enumerate(joint_names):
             self.robot.set_joint(joint_name, joint_pos_rad[i])
 
-    def _compute_target_pose(
-        self,
-        delta_ee: np.ndarray | None,
-        target_pose: np.ndarray | None,
-        frame_name: str,
-        tcp_offset: np.ndarray,
-    ) -> np.ndarray:
-        """Compute desired target pose from delta or absolute pose."""
-        if delta_ee is not None:
-            current_ee_pose = self._get_frame_pose(frame_name, tcp_offset)
-            current_pos = current_ee_pose[:3, 3]
-            current_rot = Rotation.from_matrix(current_ee_pose[:3, :3])
-
-            target_pos = current_pos + delta_ee[:3]
-            delta_rot = Rotation.from_rotvec(delta_ee[3:])
-            target_rot = delta_rot * current_rot
-
-            desired_ee_pose = np.eye(4, dtype=float)
-            desired_ee_pose[:3, :3] = target_rot.as_matrix()
-            desired_ee_pose[:3, 3] = target_pos
-            
-            # Inline readable logging #remove later
-            def _format_pose(mat):
-                x, y, z = mat[:3, 3]
-                r = Rotation.from_matrix(mat[:3, :3]).as_rotvec()
-                return f"({x:.6f}, {y:.6f}, {z:.6f}, {r[0]:.6f}, {r[1]:.6f}, {r[2]:.6f})"
-            logging.info(f"FK current: {_format_pose(current_ee_pose)}")
-            return desired_ee_pose
-
-        # target_pose is an absolute pose as [x, y, z, wx, wy, wz]
-        target_pos = target_pose[:3]
-        target_rot = Rotation.from_rotvec(target_pose[3:])
-        desired_ee_pose = np.eye(4, dtype=float)
-        desired_ee_pose[:3, :3] = target_rot.as_matrix()
-        desired_ee_pose[:3, 3] = target_pos
-        return desired_ee_pose
-
     def forward_kinematics(
         self,
         joint_pos_deg: Mapping[str, float],
@@ -692,10 +655,8 @@ class DualArmKinematics:
     def inverse_kinematics_dual(
         self,
         left_current_joint_pos: np.ndarray | None = None,
-        left_delta_ee: np.ndarray | None = None,
         left_target_pose: np.ndarray | None = None,
         right_current_joint_pos: np.ndarray | None = None,
-        right_delta_ee: np.ndarray | None = None,
         right_target_pose: np.ndarray | None = None,
         position_weight: float = 1.0,
         orientation_weight: float = 1.0,
@@ -705,26 +666,22 @@ class DualArmKinematics:
         """Compute inverse kinematics for one or both arms using a single solver.
 
         Args:
+            left_target_pose / right_target_pose: Absolute target TCP pose as a 4x4
+                homogeneous matrix in the configured reference frame (e.g.
+                arm_base_link). ``None`` skips that arm (it holds its current pose).
             hold_on_unreachable_pos_m: If set, an arm whose solved end-effector
                 position still misses the target by more than this many metres is
                 treated as unreachable: its result is replaced by the arm's input
                 current joints (i.e. "hold position") instead of the diverged/
-                clipped IK solution. ``None`` disables the check (default), so
-                existing callers (record/replay/reset) are unaffected.
+                clipped IK solution. ``None`` disables the check (default).
 
         Returns:
             Tuple of (left_joint_pos_deg, right_joint_pos_deg).  Each element is
             ``None`` if the corresponding arm was not requested.
         """
         t_ik_start = time.perf_counter()
-        # Validate inputs
-        if left_delta_ee is not None and left_target_pose is not None:
-            raise ValueError("Only one of left_delta_ee or left_target_pose should be provided.")
-        if right_delta_ee is not None and right_target_pose is not None:
-            raise ValueError("Only one of right_delta_ee or right_target_pose should be provided.")
-
-        left_requested = left_current_joint_pos is not None and (left_delta_ee is not None or left_target_pose is not None)
-        right_requested = right_current_joint_pos is not None and (right_delta_ee is not None or right_target_pose is not None)
+        left_requested = left_current_joint_pos is not None and left_target_pose is not None
+        right_requested = right_current_joint_pos is not None and right_target_pose is not None
 
         if left_requested and not self.left_frame_name:
             raise ValueError("Left arm IK requested but left_frame_name was not configured.")
@@ -739,14 +696,11 @@ class DualArmKinematics:
             self._set_robot_joint_positions(right_current_joint_pos, joint_names=self.right_joint_names)
         self.robot.update_kinematics()
 
-        # Compute target poses
-        left_target = None
+        # Target poses arrive as 4x4 TCP matrices; strip the TCP offset to get the
+        # frame target the solver tracks.
         left_frame_target = None
         if left_requested:
-            left_target = self._compute_target_pose(
-                left_delta_ee, left_target_pose, self.left_frame_name, self.left_tcp_offset
-            )
-            left_frame_target = self._tcp_pose_to_frame_pose(left_target, self.left_tcp_offset)
+            left_frame_target = self._tcp_pose_to_frame_pose(left_target_pose, self.left_tcp_offset)
             self._set_tip_target(self.left_tip, self.left_frame_name, left_frame_target)
             lp, lo = self._pose_error_norms(left_frame_target, self._get_frame_pose(self.left_frame_name))
             logging.info("IK_DIAG [l] pre_task_error pos=%.6f orient=%.6f", lp, lo)
@@ -757,13 +711,9 @@ class DualArmKinematics:
                 orientation_weight,
             )
 
-        right_target = None
         right_frame_target = None
         if right_requested:
-            right_target = self._compute_target_pose(
-                right_delta_ee, right_target_pose, self.right_frame_name, self.right_tcp_offset
-            )
-            right_frame_target = self._tcp_pose_to_frame_pose(right_target, self.right_tcp_offset)
+            right_frame_target = self._tcp_pose_to_frame_pose(right_target_pose, self.right_tcp_offset)
             self._set_tip_target(self.right_tip, self.right_frame_name, right_frame_target)
             rp, ro = self._pose_error_norms(right_frame_target, self._get_frame_pose(self.right_frame_name))
             logging.info("IK_DIAG [r] pre_task_error pos=%.6f orient=%.6f", rp, ro)

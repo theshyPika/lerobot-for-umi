@@ -51,18 +51,21 @@ class ForwardKinematicsJointsToEEObservationG2(ObservationProcessorStep):
         prefix: str,
         observation: RobotObservation,
     ) -> dict[str, float]:
-        rotvec = Rotation.from_matrix(pose[:3, :3]).as_rotvec()
+        quat = Rotation.from_matrix(pose[:3, :3]).as_quat()  # xyzw
         result = {
             f"{prefix}.ee.x": float(pose[0, 3]),
             f"{prefix}.ee.y": float(pose[1, 3]),
             f"{prefix}.ee.z": float(pose[2, 3]),
-            f"{prefix}.ee.wx": float(rotvec[0]),
-            f"{prefix}.ee.wy": float(rotvec[1]),
-            f"{prefix}.ee.wz": float(rotvec[2]),
+            f"{prefix}.ee.qx": float(quat[0]),
+            f"{prefix}.ee.qy": float(quat[1]),
+            f"{prefix}.ee.qz": float(quat[2]),
+            f"{prefix}.ee.qw": float(quat[3]),
         }
-        gripper_key = f"{prefix}.ee.gripper.pos"
-        if gripper_key in observation:
-            result[gripper_key] = float(observation[gripper_key])
+        # EE gripper mirrors the joint-space gripper state (l.gripper.pos / r.gripper.pos);
+        # GDK does not provide a separate EE gripper reading.
+        joint_gripper_key = f"{prefix}.gripper.pos"
+        if joint_gripper_key in observation:
+            result[f"{prefix}.ee.gripper.pos"] = float(observation[joint_gripper_key])
         return result
 
     def transform_features(
@@ -71,16 +74,18 @@ class ForwardKinematicsJointsToEEObservationG2(ObservationProcessorStep):
         return features
 
 
-@ProcessorStepRegistry.register("inverse_kinematics_delta_ee_to_joints")
+@ProcessorStepRegistry.register("inverse_kinematics_ee_to_joints")
 @dataclass
 class InverseKinematicsEEToJoints(RobotActionProcessorStep):
     """
-    Computes desired joint positions from an end-effector pose using inverse kinematics (IK).
+    Computes desired joint positions from an absolute end-effector pose via IK.
 
     Uses a unified ``DualArmKinematics`` solver so that both arms are solved in a single
     placo iteration when running in dual-arm mode.  Single-arm mode is supported by simply
-    requesting only one side. End-effector actions are interpreted in the kinematics solver's
-    configured reference frame, e.g. ``arm_base_link`` for G2 recording.
+    requesting only one side. Actions are absolute EE poses (position + xyzw quaternion)
+    in the solver's configured reference frame, e.g. ``arm_base_link`` for G2 — the policy
+    postprocessor has already restored absolute actions by this stage, regardless of
+    whether the policy was trained on relative actions.
 
     Attributes:
         kinematics: The unified dual-arm kinematic model.
@@ -88,7 +93,6 @@ class InverseKinematicsEEToJoints(RobotActionProcessorStep):
         left_q_curr: Internal state storing the last left joint positions.
         right_q_curr: Internal state storing the last right joint positions.
         initial_guess_current_joints: If True, use the robot's current joint state as the IK guess.
-        use_relative_actions: If True, actions are interpreted as delta end-effector poses.
     """
 
     motor_names: list[str]
@@ -96,7 +100,6 @@ class InverseKinematicsEEToJoints(RobotActionProcessorStep):
     left_q_curr: np.ndarray | None = field(default=None, init=False, repr=False)
     right_q_curr: np.ndarray | None = field(default=None, init=False, repr=False)
     initial_guess_current_joints: bool = True
-    use_relative_actions: bool = True
     ee_hold_position_threshold_m: float = 0.001
     ee_hold_rotation_threshold_rad: float = 0.01
     ik_position_weight: float = 1.0
@@ -124,24 +127,18 @@ class InverseKinematicsEEToJoints(RobotActionProcessorStep):
         if not isinstance(full_joint_positions_deg_by_name, dict) or len(full_joint_positions_deg_by_name) == 0:
             full_joint_positions_deg_by_name = None
 
-        # Prepare per-arm inputs
-        left_delta, left_target, left_q, left_joints = self._prepare_arm(
-            action, "l", observation
-        )
-        right_delta, right_target, right_q, right_joints = self._prepare_arm(
-            action, "r", observation
-        )
+        # Prepare per-arm absolute EE targets
+        left_target, left_q, left_joints = self._prepare_arm(action, "l", observation)
+        right_target, right_q, right_joints = self._prepare_arm(action, "r", observation)
 
-        left_requested = left_delta is not None or left_target is not None
-        right_requested = right_delta is not None or right_target is not None
+        left_requested = left_target is not None
+        right_requested = right_target is not None
 
         if left_requested or right_requested:
             left_result, right_result = self.kinematics.inverse_kinematics_dual(
                 left_current_joint_pos=left_q,
-                left_delta_ee=left_delta,
                 left_target_pose=left_target,
                 right_current_joint_pos=right_q,
-                right_delta_ee=right_delta,
                 right_target_pose=right_target,
                 position_weight=self.ik_position_weight,
                 orientation_weight=self.ik_orientation_weight,
@@ -193,24 +190,30 @@ class InverseKinematicsEEToJoints(RobotActionProcessorStep):
         action: RobotAction,
         prefix: str,
         observation: dict,
-    ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, list[str]]:
-        """Extract delta/target values and current joint positions for one arm.
+    ) -> tuple[np.ndarray | None, np.ndarray | None, list[str]]:
+        """Extract the absolute EE target pose and current joints for one arm.
 
-        Returns:
-            (delta_ee, target_pose, q_curr, joint_motor_names).
-            ``delta_ee`` is set when ``use_relative_actions`` is True,
-            ``target_pose`` is set otherwise. Both are None when the arm has no action keys.
+        The action carries an absolute EE pose as position + xyzw quaternion. Returns
+        ``(target_pose, q_curr, joint_motor_names)`` where ``target_pose`` is a 4x4
+        homogeneous TCP matrix in the solver's reference frame, or ``None`` when the
+        arm has no EE action keys (q_curr also None) or the target is within the hold
+        deadband (q_curr set so the caller can command current joints).
         """
-        ee_keys = [f"{prefix}.ee.{a}" for a in ("x", "y", "z", "wx", "wy", "wz")]
+        ee_keys = [f"{prefix}.ee.{a}" for a in ("x", "y", "z", "qx", "qy", "qz", "qw")]
         if not any(k in action for k in ee_keys):
-            return None, None, None, []
+            return None, None, []
 
         x = action.pop(f"{prefix}.ee.x", 0.0)
         y = action.pop(f"{prefix}.ee.y", 0.0)
         z = action.pop(f"{prefix}.ee.z", 0.0)
-        wx = action.pop(f"{prefix}.ee.wx", 0.0)
-        wy = action.pop(f"{prefix}.ee.wy", 0.0)
-        wz = action.pop(f"{prefix}.ee.wz", 0.0)
+        qx = action.pop(f"{prefix}.ee.qx", 0.0)
+        qy = action.pop(f"{prefix}.ee.qy", 0.0)
+        qz = action.pop(f"{prefix}.ee.qz", 0.0)
+        qw = action.pop(f"{prefix}.ee.qw", 1.0)
+        target_rot = Rotation.from_quat([qx, qy, qz, qw])
+        target_pose = np.eye(4, dtype=float)
+        target_pose[:3, :3] = target_rot.as_matrix()
+        target_pose[:3, 3] = [x, y, z]
 
         motor_names = [name for name in self.motor_names if name.startswith(f"{prefix}.")]
         joint_motor_names = [name for name in motor_names if "gripper" not in name]
@@ -226,26 +229,14 @@ class InverseKinematicsEEToJoints(RobotActionProcessorStep):
         if self.initial_guess_current_joints or q_curr is None:
             q_curr = q_raw
 
-        if self.use_relative_actions:
-            pos_norm = np.linalg.norm([x, y, z])
-            rot_norm = np.linalg.norm([wx, wy, wz])
-            logging.info(f"[{prefix}] pos_norm={pos_norm:.4f}, rot_norm={rot_norm:.4f}")
-
-            if pos_norm < 2e-3 and rot_norm < 1e-1:
-                logging.info(f"All delta values are zero for {prefix} arm, skipping IK")
-                return None, None, q_curr, joint_motor_names
-
-            delta_ee = np.array([x, y, z, wx, wy, wz])
-            return delta_ee, None, q_curr, joint_motor_names
-
-        obs_pose_keys = [f"{prefix}.ee.{a}" for a in ("x", "y", "z", "wx", "wy", "wz")]
-        if all(k in observation for k in obs_pose_keys):
-            obs_pose = np.array([float(observation[k]) for k in obs_pose_keys], dtype=float)
-            target_pose = np.array([x, y, z, wx, wy, wz], dtype=float)
-            pose_delta = target_pose - obs_pose
-            pos_norm = float(np.linalg.norm(pose_delta[:3]))
-            target_rot = Rotation.from_rotvec(target_pose[3:])
-            obs_rot = Rotation.from_rotvec(obs_pose[3:])
+        # Hold deadband: skip IK when the absolute target is within thresholds of the
+        # current observed EE pose, so a near-hold target is not re-solved into a
+        # different redundant posture.
+        obs_keys = [f"{prefix}.ee.{a}" for a in ("x", "y", "z", "qx", "qy", "qz", "qw")]
+        if all(k in observation for k in obs_keys):
+            obs_vals = [float(observation[k]) for k in obs_keys]
+            obs_rot = Rotation.from_quat(obs_vals[3:7])
+            pos_norm = float(np.linalg.norm(np.array([x, y, z]) - np.array(obs_vals[:3])))
             rot_norm = float(np.linalg.norm((target_rot * obs_rot.inv()).as_rotvec()))
             logging.info(
                 f"[{prefix}] absolute EE delta pos_norm={pos_norm:.6f}, rot_norm={rot_norm:.6f}"
@@ -261,20 +252,15 @@ class InverseKinematicsEEToJoints(RobotActionProcessorStep):
                     f"({self.ee_hold_position_threshold_m:.4f} m, "
                     f"{self.ee_hold_rotation_threshold_rad:.4f} rad); skipping IK"
                 )
-                return None, None, q_curr, joint_motor_names
+                return None, q_curr, joint_motor_names
 
-        else:
-            target_pose = np.array([x, y, z, wx, wy, wz])
-            return None, target_pose, q_curr, joint_motor_names
-
-        target_pose = np.array([x, y, z, wx, wy, wz])
-        return None, target_pose, q_curr, joint_motor_names
+        return target_pose, q_curr, joint_motor_names
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
         for prefix in ("l", "r"):
-            for feat in ["x", "y", "z", "wx", "wy", "wz", "gripper.pos"]:
+            for feat in ["x", "y", "z", "qx", "qy", "qz", "qw", "gripper.pos"]:
                 features[PipelineFeatureType.ACTION].pop(f"{prefix}.ee.{feat}", None)
 
         for name in self.motor_names:
