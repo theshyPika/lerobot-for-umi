@@ -215,13 +215,13 @@ ESC exits. ``--dataset.push_to_hub=false`` keeps the run local)::
             --rename_map="{\"observation.images.head_color\": \"observation.images.base_0_rgb\", \"observation.images.hand_left\": \"observation.images.left_wrist_0_rgb\", \"observation.images.hand_right\": \"observation.images.right_wrist_0_rgb\"}" \
             --display_data=true
 
-    HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 scripts/run-quiet-gdk.sh lerobot-rollout-g2 \
+   HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 scripts/run-quiet-gdk.sh lerobot-rollout-g2 \
             --fps=6 \
             --strategy.type=sentry_panic \
             --strategy.reset_time_s=10 \
             --strategy.upload_every_n_episodes=2 \
             --return_to_initial_position=false \
-            --interpolation_multiplier=5 \
+            --interpolation_multiplier=4 \
             --policy.path=/home/ck/models/finetune_models/pi05_g2_dual_arm_g1_7_relstats_clean/038000/pretrained_model \
             --policy.chunk_size=50 \
             --policy.n_action_steps=50 \
@@ -229,18 +229,52 @@ ESC exits. ``--dataset.push_to_hub=false`` keeps the run local)::
             --policy.relative_exclude_joints='["gripper"]' \
             --inference.type=rtc \
             --inference.rtc.execution_horizon=10 \
-            --inference.rtc.max_guidance_weight=10 \
+            --inference.rtc.max_guidance_weight=15 \
             --robot.type=g2 \
             --robot.use_left_arm=true --robot.use_right_arm=true \
             --robot.use_gripper=true \
-            --dataset.repo_id="luck4ck/rollout_pi05_g2_dual_arm_g1_7_relstats_clean_38k_group4_1" \
-            --dataset.root="/home/ck/.cache/huggingface/rollout_pi05_g2_dual_arm_g1_7_relstats_clean_38k_group4_1" \
+            --dataset.repo_id="luck4ck/rollout_pi05_g2_dual_arm_g1_7_relstats_clean_38k_group4_1debug12" \
+            --dataset.root="/home/ck/.cache/huggingface/rollout_pi05_g2_dual_arm_g1_7_relstats_clean_38k_group4_1debug12" \
             --dataset.single_task="将多个轴承同轴堆叠成塔形" \
             --dataset.streaming_encoding=true \
             --dataset.push_to_hub=false \
             --duration=0 \
             --rename_map="{\"observation.images.head_color\": \"observation.images.base_0_rgb\", \"observation.images.hand_left\": \"observation.images.left_wrist_0_rgb\", \"observation.images.hand_right\": \"observation.images.right_wrist_0_rgb\"}" \
-            --display_data=true
+            --display_data=true \
+            > src/lerobot/exp/stop_and_move_large13.log 2>&1 | tail -f src/lerobot/exp/stop_and_move_large13.log 
+
+
+    LEROBOT_DIAG_RTC_ROTVEC=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 scripts/run-quiet-gdk.sh lerobot-rollout-g2 \
+            --fps=6 \
+            --strategy.type=sentry_panic \
+            --strategy.reset_time_s=10 \
+            --strategy.upload_every_n_episodes=2 \
+            --return_to_initial_position=false \
+            --interpolation_multiplier=1 \
+            --policy.path=/home/ck/models/finetune_models/pi05_clean_nostill_ep_fr/checkpoints/045000/pretrained_model \
+            --policy.chunk_size=50 \
+            --policy.n_action_steps=50 \
+            --policy.use_relative_actions=true \
+            --policy.relative_exclude_joints='["gripper"]' \
+            --inference.type=rtc \
+            --inference.rtc.execution_horizon=4 \
+            --inference.rtc.max_guidance_weight=3 \
+            --ik_orientation_weight=0.03 \
+            --ik_regularization_weight=0.003 \
+            --robot.type=g2 \
+            --robot.use_left_arm=true --robot.use_right_arm=true \
+            --robot.use_gripper=true \
+            --dataset.repo_id="luck4ck/rollout_pi05_clean_nostill_ep_fr_45k_group4_1debug8" \
+            --dataset.root="/home/ck/.cache/huggingface/rollout_pi05_clean_nostill_ep_fr_45k_group4_1debug8" \
+            --dataset.single_task="将多个轴承同轴堆叠成塔形" \
+            --dataset.streaming_encoding=true \
+            --dataset.push_to_hub=false \
+            --duration=0 \
+            --rename_map="{\"observation.images.head_color\": \"observation.images.base_0_rgb\", \"observation.images.hand_left\": \"observation.images.left_wrist_0_rgb\", \"observation.images.hand_right\": \"observation.images.right_wrist_0_rgb\"}" \
+            --display_data=true \
+            > src/lerobot/exp/stop_and_move_clean_nostill_ep_fr_45k_group4_1debug8.log 2>&1 | tail -f src/lerobot/exp/stop_and_move_clean_nostill_ep_fr_45k_group4_1debug8.log
+
+        
 """ 
 
  
@@ -332,12 +366,27 @@ class RolloutConfigG2(RolloutConfig):
     # Skip IK when the absolute EE target is already close to the current EE
     # observation. Prevents near-hold commands from being re-solved into a
     # different redundant joint posture.
-    ee_hold_position_threshold_m: float = 0.001
+    ee_hold_position_threshold_m: float = 0.005
     ee_hold_rotation_threshold_rad: float = 0.005
-    # IK frame task weights. Orientation remains active but defaults low so
-    # position tracking dominates redundant/unreachable wrist orientations.
+    # IK frame task weights. With null-space stabilisation handled by the velocity
+    # regularization task (see ``ik_regularization_weight``), orientation can be
+    # tracked accurately without destabilising position. ``0.2`` keeps the wrist
+    # orientation error well under 1 deg in the reachable interior while position
+    # stays dominant (see docs/source/g2_dualarm_ik_fix.md for the sweep data).
     ik_position_weight: float = 1.0
-    ik_orientation_weight: float = 1e-2
+    ik_orientation_weight: float = 0.2
+    # Velocity (Tikhonov / DLS) regularization weight. This is the null-space
+    # stabiliser that prevents the end-effector from being flung off-target near
+    # reach/wrist singularities. Required: with it at 0 the redundant arm is
+    # unstable in the extended-reach region. Raise toward 3e-3 for smoother joints
+    # at a small position-accuracy cost.
+    ik_regularization_weight: float = 1e-3
+    # Manipulability task weight. 0 = OFF (recommended). Any positive value biases
+    # the solution away from the commanded EE target and degrades accuracy.
+    ik_manipulability_weight: float = 0.0
+    # placo solver iteration budget and integration step per IK call.
+    ik_max_iterations: int = 10
+    ik_dt: float = 5e-2
 
 
 def _build_g2_processors(cfg: RolloutConfigG2, motor_names: list[str]):
@@ -367,6 +416,10 @@ def _build_g2_processors(cfg: RolloutConfigG2, motor_names: list[str]):
         "use_relative_frame_task": cfg.use_relative_frame_task,
         "left_tcp_offset": cfg.ee_tcp_offset,
         "right_tcp_offset": cfg.ee_tcp_offset,
+        "max_iterations": cfg.ik_max_iterations,
+        "dt": cfg.ik_dt,
+        "regularization_weight": cfg.ik_regularization_weight,
+        "manipulability_weight": cfg.ik_manipulability_weight,
     }
     fk_solver = DualArmKinematics(**kinematics_kwargs)
     ik_solver = DualArmKinematics(**kinematics_kwargs)

@@ -119,11 +119,13 @@ class RobotKinematics:
         self.manipulability = self.solver.add_manipulability_task(target_frame_name, "both", 1.0)
         self.manipulability.configure("manipulability", "soft", 1e-2)
 
-        # Solver parameters
+        # Solver parameters. NOTE: placo.KinematicsSolver exposes only `dt` here;
+        # the former `self.solver.eps = eps` / `self.solver.damping = 0.6` were
+        # silent no-ops (placo has no such attributes). The `eps` constructor arg is
+        # currently unused (convergence uses a hard-coded threshold below) and kept
+        # only for backward-compatible call signatures.
         self.solver.dt = dt
-        self.solver.eps = eps
-        self.solver.damping = 0.6
-        
+
 
         # Cache for joint regularization dictionary to avoid repeated construction
         self._joint_reg_dict = {name: 0.0 for name in self.joint_names}
@@ -347,9 +349,10 @@ class DualArmKinematics:
         use_relative_frame_task: bool = True,
         left_tcp_offset: np.ndarray | list[float] | tuple[float, float, float] | None = None,
         right_tcp_offset: np.ndarray | list[float] | tuple[float, float, float] | None = None,
-        max_iterations: int = 3,
-        dt: float = 1e-2,
-        eps: float = 1e-6,
+        max_iterations: int = 10,
+        dt: float = 5e-2,
+        regularization_weight: float = 1e-3,
+        manipulability_weight: float = 0.0,
     ):
         try:
             import placo  # type: ignore[import-not-found]
@@ -387,23 +390,38 @@ class DualArmKinematics:
             if j_name not in enabled_joints:
                 self.solver.mask_dof(j_name)
 
+        # Manipulability tasks are OFF by default. A manipulability task maximises a
+        # secondary objective (distance from singularities) that biases the solution
+        # AWAY from the commanded EE target, producing a steady-state position error
+        # (empirically a ~3.5 mm accuracy floor) and, near the reach boundary, large
+        # off-target end-effector excursions. Null-space stabilisation is handled
+        # instead by the velocity regularization task below, which has no such bias.
         self.left_tip = None
         self.left_manip = None
         if self.left_frame_name:
             self.left_tip = self._add_frame_task(self.left_frame_name)
-            self.left_manip = self.solver.add_manipulability_task(self.left_frame_name, "both", 1.0)
-            self.left_manip.configure("manip_left", "soft", 1e-3)
+            if manipulability_weight > 0.0:
+                self.left_manip = self.solver.add_manipulability_task(self.left_frame_name, "both", 1.0)
+                self.left_manip.configure("manip_left", "soft", manipulability_weight)
 
         self.right_tip = None
         self.right_manip = None
         if self.right_frame_name:
             self.right_tip = self._add_frame_task(self.right_frame_name)
-            self.right_manip = self.solver.add_manipulability_task(self.right_frame_name, "both", 1.0)
-            self.right_manip.configure("manip_right", "soft", 1e-3)
+            if manipulability_weight > 0.0:
+                self.right_manip = self.solver.add_manipulability_task(self.right_frame_name, "both", 1.0)
+                self.right_manip.configure("manip_right", "soft", manipulability_weight)
 
         self.solver.dt = dt
-        self.solver.eps = eps
-        self.solver.damping = 0.6
+        # NOTE: placo.KinematicsSolver exposes neither `eps` nor `damping`; the previous
+        # `self.solver.eps = ...` / `self.solver.damping = ...` assignments were silent
+        # no-ops (they only set dead Python attributes). Velocity regularization
+        # (Tikhonov / damped-least-squares) is the real stabiliser: it damps the
+        # ill-conditioned joint velocities near reach/wrist singularities that would
+        # otherwise fling the end-effector far off the commanded target, WITHOUT adding
+        # a steady-state bias (its cost -> 0 as joint velocity -> 0 at convergence).
+        if regularization_weight > 0.0:
+            self.solver.add_regularization_task(regularization_weight)
 
     @staticmethod
     def _load_joint_limits_deg(urdf_path: str) -> dict[str, tuple[float, float]]:
@@ -540,6 +558,41 @@ class DualArmKinematics:
         orient_err = float(np.linalg.norm((target_rot * current_rot.inv()).as_rotvec()))
         return pos_err, orient_err
 
+    def _should_hold_unreachable(
+        self,
+        frame_target: np.ndarray | None,
+        frame_name: str | None,
+        threshold_m: float | None,
+        side: str,
+    ) -> bool:
+        """True if the just-solved arm misses its target position by > threshold.
+
+        Compares the achieved frame pose (from the solver's final state) against
+        the requested frame target. Used to "hold position" instead of sending a
+        diverged/unreachable IK solution. Returns False when disabled or unusable.
+        """
+        if threshold_m is None or threshold_m <= 0.0 or frame_target is None or frame_name is None:
+            return False
+        achieved = self._get_frame_pose(frame_name)
+        pos_err, orient_err = self._pose_error_norms(frame_target, achieved)
+        if pos_err > threshold_m:
+            tx, ty, tz = frame_target[:3, 3]
+            logging.warning(
+                "[%s] EE target UNREACHABLE - holding current joints | "
+                "target=(%.3f, %.3f, %.3f)m dist_from_base=%.3fm | "
+                "pos_err=%.4fm (thr=%.4fm) orient_err=%.2fdeg",
+                side,
+                tx,
+                ty,
+                tz,
+                float(np.linalg.norm([tx, ty, tz])),
+                pos_err,
+                threshold_m,
+                np.rad2deg(orient_err),
+            )
+            return True
+        return False
+
     def _set_tip_target(self, tip, frame_name: str, target_pose: np.ndarray) -> np.ndarray:
         if self._uses_relative_frame_task:
             tip.T_a_b = target_pose
@@ -647,8 +700,17 @@ class DualArmKinematics:
         position_weight: float = 1.0,
         orientation_weight: float = 1.0,
         current_joint_pos_by_name: Mapping[str, float] | None = None,
+        hold_on_unreachable_pos_m: float | None = None,
     ) -> tuple[np.ndarray | None, np.ndarray | None]:
         """Compute inverse kinematics for one or both arms using a single solver.
+
+        Args:
+            hold_on_unreachable_pos_m: If set, an arm whose solved end-effector
+                position still misses the target by more than this many metres is
+                treated as unreachable: its result is replaced by the arm's input
+                current joints (i.e. "hold position") instead of the diverged/
+                clipped IK solution. ``None`` disables the check (default), so
+                existing callers (record/replay/reset) are unaffected.
 
         Returns:
             Tuple of (left_joint_pos_deg, right_joint_pos_deg).  Each element is
@@ -794,6 +856,8 @@ class DualArmKinematics:
                 np.array2string(left_raw_deg - left_current_joint_pos[: len(self.left_joint_names)], precision=6, suppress_small=False),
             )
             left_result = self._clip_joint_positions_deg(self.left_joint_names, left_raw_deg)
+            if self._should_hold_unreachable(left_frame_target, self.left_frame_name, hold_on_unreachable_pos_m, "l"):
+                left_result = np.asarray(left_current_joint_pos, dtype=float)[: len(self.left_joint_names)]
 
         right_result = None
         if right_requested:
@@ -804,6 +868,8 @@ class DualArmKinematics:
                 np.array2string(right_raw_deg - right_current_joint_pos[: len(self.right_joint_names)], precision=6, suppress_small=False),
             )
             right_result = self._clip_joint_positions_deg(self.right_joint_names, right_raw_deg)
+            if self._should_hold_unreachable(right_frame_target, self.right_frame_name, hold_on_unreachable_pos_m, "r"):
+                right_result = np.asarray(right_current_joint_pos, dtype=float)[: len(self.right_joint_names)]
 
         t_ik_end = time.perf_counter()
         logging.info(f"IK took {(t_ik_end - t_ik_start)*1000:.2f} ms")

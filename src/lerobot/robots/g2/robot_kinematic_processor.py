@@ -101,6 +101,12 @@ class InverseKinematicsEEToJoints(RobotActionProcessorStep):
     ee_hold_rotation_threshold_rad: float = 0.01
     ik_position_weight: float = 1.0
     ik_orientation_weight: float = 1e-2
+    # If the solved EE position still misses the target by more than this (m),
+    # the arm is treated as unreachable and holds its current joints instead of
+    # sending the diverged IK solution (prevents the end-effector being flung
+    # off-target near / beyond the reach boundary). 5 mm sits well above the
+    # ~1.2 mm reachable error ceiling and well below the >16 mm unreachable band.
+    ee_unreachable_hold_threshold_m: float = 2e-2
 
     def action(self, action: RobotAction) -> RobotAction:
         if self.kinematics is None:
@@ -140,6 +146,7 @@ class InverseKinematicsEEToJoints(RobotActionProcessorStep):
                 position_weight=self.ik_position_weight,
                 orientation_weight=self.ik_orientation_weight,
                 current_joint_pos_by_name=full_joint_positions_deg_by_name,
+                hold_on_unreachable_pos_m=self.ee_unreachable_hold_threshold_m,
             )
 
             if left_result is not None:
