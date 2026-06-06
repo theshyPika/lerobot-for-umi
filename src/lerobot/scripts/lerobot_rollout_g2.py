@@ -20,7 +20,7 @@ The generic ``lerobot-rollout`` script does not know about the G2's
 end-effector action space.  This script wires the G2 forward/inverse
 kinematics processors into the rollout context so that:
 
-* observations expose EE poses (``l.ee.x`` … ``r.ee.wz``) computed by FK,
+* observations expose EE poses (``l.ee.x`` … ``r.ee.qw``) computed by FK,
 * policy actions in the same EE space are converted to joint targets via
   IK before ``robot.send_action``.
 

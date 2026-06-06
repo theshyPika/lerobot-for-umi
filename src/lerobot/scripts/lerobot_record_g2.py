@@ -602,7 +602,6 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 motor_names=list(robot.motors),
                 kinematics=ik_kinematics_solver,
                 initial_guess_current_joints=True,
-                use_relative_actions=False, # TODO： refactor after due to the always absolute action output by prediction actions. @ck
                 ee_hold_position_threshold_m=cfg.ee_hold_position_threshold_m,
                 ee_hold_rotation_threshold_rad=cfg.ee_hold_rotation_threshold_rad,
                 ik_position_weight=cfg.ik_position_weight,

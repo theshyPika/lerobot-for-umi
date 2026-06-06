@@ -183,40 +183,19 @@ class G2Robot(Robot):
 
 
     def _ordered_action_feature_names(self) -> list[str]:
-        if self.config.dual_arm:
+        # Absolute EE pose action: 3 position + 4 quaternion (xyzw) + optional gripper.
+        def arm_keys(p: str) -> list[str]:
             names = [
-                "l.ee.x",
-                "l.ee.y",
-                "l.ee.z",
-                "l.ee.wx",
-                "l.ee.wy",
-                "l.ee.wz",
+                f"{p}.ee.x", f"{p}.ee.y", f"{p}.ee.z",
+                f"{p}.ee.qx", f"{p}.ee.qy", f"{p}.ee.qz", f"{p}.ee.qw",
             ]
             if self.config.use_gripper:
-                names.append("l.ee.gripper.pos")
-            names.extend([
-                "r.ee.x",
-                "r.ee.y",
-                "r.ee.z",
-                "r.ee.wx",
-                "r.ee.wy",
-                "r.ee.wz",
-            ])
-            if self.config.use_gripper:
-                names.append("r.ee.gripper.pos")
+                names.append(f"{p}.ee.gripper.pos")
             return names
-        prefix = self.config.single_arm_prefix
-        names = [
-            f"{prefix}.ee.x",
-            f"{prefix}.ee.y",
-            f"{prefix}.ee.z",
-            f"{prefix}.ee.wx",
-            f"{prefix}.ee.wy",
-            f"{prefix}.ee.wz",
-        ]
-        if self.config.use_gripper:
-            names.append(f"{prefix}.ee.gripper.pos")
-        return names
+
+        if self.config.dual_arm:
+            return arm_keys("l") + arm_keys("r")
+        return arm_keys("l") if self.config.use_left_arm else arm_keys("r")
 
     def _resolve_default_joint_positions(self) -> tuple[float, ...]:
         n = len(self._joint_observation_key_names())
@@ -1194,75 +1173,6 @@ class G2Robot(Robot):
                 
         except Exception as e:
             logger.error(f"记录{arm}臂初始位姿失败: {e}")
-    
-    def _is_ee_pose_mode(self, action: dict[str, Any]) -> bool:
-        """检查是否为末端执行器位姿控制模式（6DoF轴角表示）"""
-        # 检查是否有delta动作键（轴角表示）
-        delta_keys = ["l.ee.x", "r.ee.x", "l.ee.wx", "r.ee.wx"]
-        for key in delta_keys:
-            if key in action:
-                return True
-        
-        # 检查单臂模式的前缀
-        prefix = self.config.single_arm_prefix
-        single_arm_keys = [f"{prefix}.ee.x", f"{prefix}.ee.wx"]
-        for key in single_arm_keys:
-            if key in action:
-                return True
-        
-        return False
-    
-    def _get_dual_arm_activation(self, action: dict[str, Any]) -> tuple[bool, bool]:
-        """获取双臂模式的激活状态（6DoF轴角表示）"""
-        # 从动作中提取左臂delta值（6DoF：平移3 + 旋转3）
-        left_delta_values = [
-            action.get("l.ee.x", 0.0),
-            action.get("l.ee.y", 0.0),
-            action.get("l.ee.z", 0.0),
-            action.get("l.ee.wx", 0.0),
-            action.get("l.ee.wy", 0.0),
-            action.get("l.ee.wz", 0.0)
-        ]
-        
-        # 从动作中提取右臂delta值（6DoF：平移3 + 旋转3）
-        right_delta_values = [
-            action.get("r.ee.x", 0.0),
-            action.get("r.ee.y", 0.0),
-            action.get("r.ee.z", 0.0),
-            action.get("r.ee.wx", 0.0),
-            action.get("r.ee.wy", 0.0),
-            action.get("r.ee.wz", 0.0)
-        ]
-        
-        # 基于delta值判断激活状态（6DoF版本）
-        left_active = self._is_arm_active_by_delta_6dof(left_delta_values)
-        right_active = self._is_arm_active_by_delta_6dof(right_delta_values)
-        
-        return left_active, right_active
-    
-    def _get_single_arm_activation(self, action: dict[str, Any]) -> tuple[bool, bool]:
-        """获取单臂模式的激活状态（6DoF轴角表示）"""
-        prefix = self.config.single_arm_prefix
-        is_left_arm = self.config.use_left_arm
-        
-        # 提取delta值（6DoF：平移3 + 旋转3）
-        delta_values = [
-            action.get(f"{prefix}.ee.x", 0.0),
-            action.get(f"{prefix}.ee.y", 0.0),
-            action.get(f"{prefix}.ee.z", 0.0),
-            action.get(f"{prefix}.ee.wx", 0.0),
-            action.get(f"{prefix}.ee.wy", 0.0),
-            action.get(f"{prefix}.ee.wz", 0.0)
-        ]
-        
-        # 基于delta值判断激活状态（6DoF版本）
-        arm_active = self._is_arm_active_by_delta_6dof(delta_values)
-        
-        # 根据配置返回激活状态
-        if is_left_arm:
-            return arm_active, False  # 左臂激活，右臂不激活
-        else:
-            return False, arm_active  # 左臂不激活，右臂激活
     
     def _init_grippers(self, calibrate: bool = True):
         """根据配置初始化夹爪"""
