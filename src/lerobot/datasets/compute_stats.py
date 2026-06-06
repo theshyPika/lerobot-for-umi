@@ -18,8 +18,13 @@ from __future__ import annotations
 import logging
 
 import numpy as np
+import torch
 
 from lerobot.processor import RelativeActionsProcessorStep
+from lerobot.processor.relative_action_processor import (
+    detect_quaternion_indices_from_names,
+    to_relative_actions,
+)
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 from .io_utils import load_image_as_numpy
@@ -649,9 +654,14 @@ def _compute_relative_chunk_batch(
     all_actions: np.ndarray,
     all_states: np.ndarray,
     chunk_size: int,
-    relative_mask: np.ndarray,
+    relative_mask: list[bool],
+    quaternion_indices: list[tuple[int, int, int, int]],
 ) -> np.ndarray:
     """Vectorised relative-action computation for a batch of start indices.
+
+    Routes through ``to_relative_actions`` so the relative-stats distribution is
+    identical to what the training preprocessor produces: additive for position/
+    scalar dims, multiplicative (q_action ⊗ q_state⁻¹) for quaternion dims.
 
     Returns an ``(N * chunk_size, action_dim)`` float32 array.
     """
@@ -659,11 +669,10 @@ def _compute_relative_chunk_batch(
         return np.empty((0, all_actions.shape[1]), dtype=np.float32)
     offsets = np.arange(chunk_size)
     frame_idx = start_indices[:, None] + offsets[None, :]
-    chunks = all_actions[frame_idx].copy()
-    states = all_states[start_indices]
-    mask_dim = len(relative_mask)
-    chunks[:, :, :mask_dim] -= states[:, None, :mask_dim] * relative_mask[None, None, :]
-    return chunks.reshape(-1, all_actions.shape[1])
+    chunks = torch.from_numpy(all_actions[frame_idx].copy())  # (N, T, D)
+    states = torch.from_numpy(all_states[start_indices].copy())  # (N, D)
+    rel = to_relative_actions(chunks, states, relative_mask, quaternion_indices)
+    return rel.numpy().reshape(-1, all_actions.shape[1])
 
 
 def compute_relative_action_stats(
@@ -708,7 +717,14 @@ def compute_relative_action_stats(
         exclude_joints=exclude_joints,
         action_names=action_names,
     )
-    relative_mask = np.array(mask_step._build_mask(action_dim), dtype=np.float32)
+    relative_mask = mask_step._build_mask(action_dim)  # list[bool]
+    quaternion_indices = detect_quaternion_indices_from_names(action_names)
+    if quaternion_indices:
+        logging.info(
+            "Relative action stats: %d quaternion quadruplet(s) composed multiplicatively: %s",
+            len(quaternion_indices),
+            quaternion_indices,
+        )
 
     logging.info("Loading action/state data for relative action stats...")
     all_actions = np.array(hf_dataset[ACTION], dtype=np.float32)
@@ -744,6 +760,7 @@ def compute_relative_action_stats(
                     all_states,
                     chunk_size,
                     relative_mask,
+                    quaternion_indices,
                 )
                 for batch in batches
             ]
@@ -752,7 +769,9 @@ def compute_relative_action_stats(
     else:
         for batch in batches:
             running_stats.update(
-                _compute_relative_chunk_batch(batch, all_actions, all_states, chunk_size, relative_mask)
+                _compute_relative_chunk_batch(
+                    batch, all_actions, all_states, chunk_size, relative_mask, quaternion_indices
+                )
             )
 
     stats = running_stats.get_statistics()
