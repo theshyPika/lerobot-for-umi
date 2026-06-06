@@ -232,18 +232,19 @@ def replay(cfg: G2ReplayConfig):
                             calibration_start_obs[key]
                             + alpha * (first_obs[key] - calibration_start_obs[key])
                         )
-                # Spherical linear interpolation for rotation (rotvec)
-                rot_keys = [f"{prefix}.ee.{a}" for a in ("wx", "wy", "wz")]
-                if all(k in first_obs and k in calibration_start_obs for k in rot_keys):
-                    curr_rot = Rotation.from_rotvec(
-                        np.array([float(calibration_start_obs[k]) for k in rot_keys])
+                # Spherical linear interpolation for rotation (quaternion xyzw).
+                # Single start->target slerp via the shortest-arc delta rotvec.
+                quat_keys = [f"{prefix}.ee.{a}" for a in ("qx", "qy", "qz", "qw")]
+                if all(k in first_obs and k in calibration_start_obs for k in quat_keys):
+                    curr_rot = Rotation.from_quat(
+                        np.array([float(calibration_start_obs[k]) for k in quat_keys])
                     )
-                    target_rot = Rotation.from_rotvec(
-                        np.array([float(first_obs[k]) for k in rot_keys])
+                    target_rot = Rotation.from_quat(
+                        np.array([float(first_obs[k]) for k in quat_keys])
                     )
                     rel_rot = target_rot * curr_rot.inv()
                     interp_rot = Rotation.from_rotvec(alpha * rel_rot.as_rotvec()) * curr_rot
-                    for k, v in zip(rot_keys, interp_rot.as_rotvec()):
+                    for k, v in zip(quat_keys, interp_rot.as_quat()):
                         interp_action[k] = float(v)
                 gripper_key = f"{prefix}.ee.gripper.pos"
                 if gripper_key in first_obs:

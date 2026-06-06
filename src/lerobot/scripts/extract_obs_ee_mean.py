@@ -10,10 +10,13 @@ Extract the observation EE mean from a pretrained pi05 model's normalizer.
 
 The pi05 G2 policy stores per-feature dataset statistics inside its preprocessor
 ``policy_preprocessor_step_3_normalizer_processor.safetensors``. For a model
-trained with EE-pose observations, ``observation.state.mean`` is a 14-dim
+trained with EE-pose observations, ``observation.state.mean`` is a 16-dim
 vector that aligns with the standard G2 EE feature names
-(l.ee.x, l.ee.y, l.ee.z, l.ee.wx, l.ee.wy, l.ee.wz, l.ee.gripper.pos and the
-r.* counterparts).
+(l.ee.x, l.ee.y, l.ee.z, l.ee.qx, l.ee.qy, l.ee.qz, l.ee.qw, l.ee.gripper.pos
+and the r.* counterparts).
+
+Note: the per-component mean of unit quaternions is not itself a unit quaternion;
+consumers (e.g. reset_g2_to_ee_mean.py) should renormalize the quaternion block.
 
 This script loads that mean vector, maps it back to named keys, prints it,
 and optionally writes a JSON file consumable by ``reset_g2_to_ee_mean.py``.
@@ -34,25 +37,27 @@ from safetensors.torch import load_file
 from lerobot.utils.utils import init_logging
 
 
-DEFAULT_EE_NAMES_14 = [
+DEFAULT_EE_NAMES_16 = [
     "l.ee.x",
     "l.ee.y",
     "l.ee.z",
-    "l.ee.wx",
-    "l.ee.wy",
-    "l.ee.wz",
+    "l.ee.qx",
+    "l.ee.qy",
+    "l.ee.qz",
+    "l.ee.qw",
     "l.ee.gripper.pos",
     "r.ee.x",
     "r.ee.y",
     "r.ee.z",
-    "r.ee.wx",
-    "r.ee.wy",
-    "r.ee.wz",
+    "r.ee.qx",
+    "r.ee.qy",
+    "r.ee.qz",
+    "r.ee.qw",
     "r.ee.gripper.pos",
 ]
 
-DEFAULT_EE_NAMES_7_LEFT = DEFAULT_EE_NAMES_14[:7]
-DEFAULT_EE_NAMES_7_RIGHT = DEFAULT_EE_NAMES_14[7:]
+DEFAULT_EE_NAMES_8_LEFT = DEFAULT_EE_NAMES_16[:8]
+DEFAULT_EE_NAMES_8_RIGHT = DEFAULT_EE_NAMES_16[8:]
 
 
 def _resolve_normalizer_path(model_path: Path) -> Path:
@@ -84,15 +89,15 @@ def _pick_feature_names(num_values: int, override: list[str] | None) -> list[str
                 f"--feature_names has {len(override)} entries but observation.state.mean has {num_values}."
             )
         return list(override)
-    if num_values == 14:
-        return DEFAULT_EE_NAMES_14
-    if num_values == 7:
+    if num_values == 16:
+        return DEFAULT_EE_NAMES_16
+    if num_values == 8:
         # Cannot infer single-arm side from stats alone; default to left and warn.
         logging.warning(
-            "observation.state.mean has 7 entries — assuming left arm. "
+            "observation.state.mean has 8 entries — assuming left arm. "
             "Pass --feature_names if this is the right arm."
         )
-        return DEFAULT_EE_NAMES_7_LEFT
+        return DEFAULT_EE_NAMES_8_LEFT
     raise ValueError(
         f"observation.state.mean has {num_values} entries; no default naming. "
         "Pass --feature_names explicitly."

@@ -175,14 +175,24 @@ def reset(cfg: G2ResetConfig):
         # plain slerp factor on the same rotation axis.
         rot_starts: dict[str, Rotation] = {}
         rot_deltas: dict[str, Rotation] = {}
+        quat_keys_by_prefix: dict[str, list[str]] = {}
         for prefix in active_prefixes:
-            rot_keys = [f"{prefix}.ee.{a}" for a in ("wx", "wy", "wz")]
-            if not all(k in start_obs and k in target_ee for k in rot_keys):
+            quat_keys = [f"{prefix}.ee.{a}" for a in ("qx", "qy", "qz", "qw")]
+            if not all(k in start_obs and k in target_ee for k in quat_keys):
                 continue
-            start_rot = Rotation.from_rotvec(np.array([float(start_obs[k]) for k in rot_keys]))
-            target_rot = Rotation.from_rotvec(np.array([float(target_ee[k]) for k in rot_keys]))
+
+            def _unit_quat(src: dict, keys: list[str]) -> np.ndarray:
+                q = np.array([float(src[k]) for k in keys], dtype=float)
+                n = np.linalg.norm(q)
+                return q / n if n > 1e-8 else np.array([0.0, 0.0, 0.0, 1.0])
+
+            # The target may be a per-component quaternion mean, which is not unit;
+            # renormalize before constructing the rotation.
+            start_rot = Rotation.from_quat(_unit_quat(start_obs, quat_keys))
+            target_rot = Rotation.from_quat(_unit_quat(target_ee, quat_keys))
             rot_starts[prefix] = start_rot
             rot_deltas[prefix] = target_rot * start_rot.inv()
+            quat_keys_by_prefix[prefix] = quat_keys
 
         for step in range(1, steps + 1):
             current_obs = robot_observation_processor(robot.get_observation())
@@ -197,9 +207,10 @@ def reset(cfg: G2ResetConfig):
                             start_obs[key] + alpha * (target_ee[key] - start_obs[key])
                         )
                 if prefix in rot_starts:
-                    rot_keys = [f"{prefix}.ee.{a}" for a in ("wx", "wy", "wz")]
+                    # Single start->target slerp via the shortest-arc delta rotvec
+                    # (one rotation, so no antipodal-twin chunk issue); emit xyzw.
                     interp_rot = Rotation.from_rotvec(alpha * rot_deltas[prefix].as_rotvec()) * rot_starts[prefix]
-                    for k, v in zip(rot_keys, interp_rot.as_rotvec()):
+                    for k, v in zip(quat_keys_by_prefix[prefix], interp_rot.as_quat()):
                         interp_action[k] = float(v)
                 gripper_key = f"{prefix}.ee.gripper.pos"
                 if gripper_key in target_ee:
