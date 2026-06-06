@@ -17,6 +17,8 @@
 """Custom rotation utilities to replace scipy.spatial.transform.Rotation."""
 
 import numpy as np
+import torch
+from torch import Tensor
 
 
 class Rotation:
@@ -268,3 +270,43 @@ class Rotation:
         )
 
         return Rotation(composed_quat)
+
+
+# --- Batched torch quaternion ops (xyzw layout) ------------------------------------
+#
+# The ``Rotation`` class above is numpy-only and single-instance. The functions below
+# are the torch, batch-friendly, autograd-safe counterparts used in the action
+# pipeline (relative/absolute conversion, interpolation), where quaternions live as
+# ``(..., 4)`` tensors on GPU. They mirror ``Rotation``'s ``[x, y, z, w]`` convention.
+
+
+def quat_multiply(qa: Tensor, qb: Tensor) -> Tensor:
+    """Hamilton product ``qa ⊗ qb`` of two xyzw quaternions.
+
+    Broadcasts over leading dims; operates on the last dim of length 4. The product
+    is the rotation "apply qb first, then qa" (same convention as ``Rotation.__mul__``,
+    i.e. ``quat_multiply(q2, q1)`` applies ``q1`` then ``q2``).
+    """
+    ax, ay, az, aw = qa[..., 0], qa[..., 1], qa[..., 2], qa[..., 3]
+    bx, by, bz, bw = qb[..., 0], qb[..., 1], qb[..., 2], qb[..., 3]
+    x = aw * bx + ax * bw + ay * bz - az * by
+    y = aw * by - ax * bz + ay * bw + az * bx
+    z = aw * bz + ax * by - ay * bx + az * bw
+    w = aw * bw - ax * bx - ay * by - az * bz
+    return torch.stack([x, y, z, w], dim=-1)
+
+
+def quat_conjugate(q: Tensor) -> Tensor:
+    """Conjugate of an xyzw quaternion (== inverse for unit quaternions)."""
+    sign = torch.tensor([-1.0, -1.0, -1.0, 1.0], device=q.device, dtype=q.dtype)
+    return q * sign
+
+
+def quat_normalize(q: Tensor, eps: float = 1e-8) -> Tensor:
+    """Normalize xyzw quaternions to unit length along the last dim."""
+    return q / q.norm(dim=-1, keepdim=True).clamp_min(eps)
+
+
+def quat_canonicalize(q: Tensor) -> Tensor:
+    """Force ``qw >= 0`` so a rotation uses its short-arc representation."""
+    return torch.where(q[..., 3:4] < 0, -q, q)

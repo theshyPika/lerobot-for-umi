@@ -22,7 +22,7 @@ import time
 from typing import TYPE_CHECKING
 
 from lerobot.datasets.utils import DEFAULT_VIDEO_FILE_SIZE_IN_MB
-from lerobot.utils.action_interpolator import ActionInterpolator, detect_rotvec_groups_from_keys
+from lerobot.utils.action_interpolator import ActionInterpolator, detect_rotvec_indices_from_keys
 from lerobot.utils.constants import OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame
 from lerobot.utils.robot_utils import precise_sleep
@@ -65,16 +65,16 @@ class RolloutStrategy(abc.ABC):
         # ordered action keys so the interpolator can pick the geometric short
         # path for each rotation instead of linearly blending across the
         # rotvec antipodal-twin discontinuity.
-        rotation_groups = detect_rotvec_groups_from_keys(ctx.data.ordered_action_keys)
-        if rotation_groups:
+        rotation_indices = detect_rotvec_indices_from_keys(ctx.data.ordered_action_keys)
+        if rotation_indices:
             logger.info(
                 "ActionInterpolator: detected %d rotvec column triplet(s) for alignment: %s",
-                len(rotation_groups),
-                rotation_groups,
+                len(rotation_indices),
+                rotation_indices,
             )
         self._interpolator = ActionInterpolator(
             multiplier=ctx.runtime.cfg.interpolation_multiplier,
-            rotation_groups=rotation_groups,
+            rotation_indices=rotation_indices,
         )
         self._engine = ctx.policy.inference
         logger.info("Starting inference engine...")

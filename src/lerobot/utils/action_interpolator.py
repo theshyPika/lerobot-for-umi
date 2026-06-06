@@ -24,7 +24,7 @@ import torch
 from torch import Tensor
 
 # temp fix @ck
-def detect_rotvec_groups_from_keys(action_keys: list[str]) -> list[tuple[int, int, int]]:
+def detect_rotvec_indices_from_keys(action_keys: list[str]) -> list[tuple[int, int, int]]:
     """Detect axis-angle (``wx``/``wy``/``wz``) rotvec triplets in an action key list.
 
     Returns a list of ``(idx_wx, idx_wy, idx_wz)`` index triplets for every
@@ -102,23 +102,23 @@ class ActionInterpolator:
         component-wise linear interpolation is geometrically incorrect near
         ``‖r‖ = π``: two adjacent actions can be antipodal twins of the same
         rotation but lie ~``2π`` apart as 3-vectors, so the blend sweeps through
-        identity and the gripper tumbles. Pass ``rotation_groups`` to align each
+        identity and the gripper tumbles. Pass ``rotation_indices`` to align each
         rotvec triplet to ``_prev`` before linear interpolation; this gives the
         geometric short path without changing anything for other columns.
-        The companion helper :func:`detect_rotvec_groups_from_keys` infers the
+        The companion helper :func:`detect_rotvec_indices_from_keys` infers the
         triplets from the action key naming convention.
     """
 
     def __init__(
         self,
         multiplier: int = 1,
-        rotation_groups: list[tuple[int, int, int]] | None = None,
+        rotation_indices: list[tuple[int, int, int]] | None = None,
     ):
         """Initialize the interpolator.
 
         Args:
             multiplier: Control rate multiplier (1 = no interpolation, 2 = 2x, 3 = 3x, etc.)
-            rotation_groups: Optional list of ``(idx_wx, idx_wy, idx_wz)`` index
+            rotation_indices: Optional list of ``(idx_wx, idx_wy, idx_wz)`` index
                 triplets specifying rotvec columns of the action vector. Each
                 triplet is aligned against ``_prev`` (antipodal-twin pick) before
                 the linear interpolation step. ``None`` (default) keeps the pure
@@ -127,7 +127,7 @@ class ActionInterpolator:
         if multiplier < 1:
             raise ValueError(f"multiplier must be >= 1, got {multiplier}")
         self.multiplier = multiplier
-        self.rotation_groups: list[tuple[int, int, int]] = list(rotation_groups or [])
+        self.rotation_indices: list[tuple[int, int, int]] = list(rotation_indices or [])
         self._prev: Tensor | None = None
         self._buffer: list[Tensor] = []
         self._idx = 0
@@ -157,11 +157,11 @@ class ActionInterpolator:
             # Antipodal-twin alignment of each rotvec triplet against ``_prev`` so the
             # subsequent linear blend takes the geometric short path instead of
             # tumbling through identity. No-op for the all-linear case
-            # (``rotation_groups`` empty) and for triplets whose new rotvec is already
+            # (``rotation_indices`` empty) and for triplets whose new rotvec is already
             # the closer representation.
-            if self.rotation_groups:
+            if self.rotation_indices:
                 action = action.clone()
-                for ix, iy, iz in self.rotation_groups:
+                for ix, iy, iz in self.rotation_indices:
                     r_new = action[[ix, iy, iz]]
                     r_ref = self._prev[[ix, iy, iz]]
                     r_aligned = _align_rotvec_to_ref(r_new, r_ref)

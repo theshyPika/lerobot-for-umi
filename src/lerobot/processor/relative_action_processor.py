@@ -22,6 +22,12 @@ from torch import Tensor
 from lerobot.configs import PipelineFeatureType, PolicyFeature
 from lerobot.types import EnvTransition, TransitionKey
 from lerobot.utils.constants import OBS_STATE
+from lerobot.utils.rotation import (
+    quat_canonicalize,
+    quat_conjugate,
+    quat_multiply,
+    quat_normalize,
+)
 
 from .delta_action_processor import MapDeltaActionToRobotActionStep, MapTensorToDeltaActionDictStep
 from .pipeline import ProcessorStep, ProcessorStepRegistry
@@ -34,50 +40,142 @@ __all__ = [
     "AbsoluteActionsProcessorStep",
     "to_relative_actions",
     "to_absolute_actions",
+    "detect_quaternion_indices_from_names",
 ]
 
 
-def to_relative_actions(actions: Tensor, state: Tensor, mask: Sequence[bool]) -> Tensor:
-    """Convert absolute actions to relative: relative = action - state (for masked dims).
+def detect_quaternion_indices_from_names(
+    action_names: Sequence[str] | None,
+) -> list[tuple[int, int, int, int]]:
+    """Detect xyzw quaternion column quadruplets from action dimension names.
+
+    Returns one ``(idx_qx, idx_qy, idx_qz, idx_qw)`` tuple per distinct prefix that
+    has all four of ``<prefix>.qx/.qy/.qz/.qw`` present (e.g. ``l.ee`` -> the four
+    ``l.ee.q*`` indices). Empty list when names are absent or contain no quaternion
+    columns, in which case the relative/absolute conversion stays purely additive.
+
+    Orientation dims must be composed multiplicatively rather than subtracted/added:
+    quaternion subtraction has no geometric meaning. The quadruplet grouping is
+    semantically required — each arm's 4 components form one rotation and must be
+    multiplied as a unit.
+    """
+    if not action_names:
+        return []
+    name_to_idx = {str(n): i for i, n in enumerate(action_names)}
+    indices: list[tuple[int, int, int, int]] = []
+    seen: set[str] = set()
+    for n in action_names:
+        name = str(n)
+        if not name.endswith(".qx"):
+            continue
+        prefix = name[:-3]
+        if prefix in seen:
+            continue
+        comps = [f"{prefix}.qx", f"{prefix}.qy", f"{prefix}.qz", f"{prefix}.qw"]
+        if all(c in name_to_idx for c in comps):
+            indices.append(tuple(name_to_idx[c] for c in comps))  # type: ignore[arg-type]
+            seen.add(prefix)
+    return indices
+
+
+def _additive_mask(
+    mask: Sequence[bool], quaternion_indices: Sequence[tuple[int, int, int, int]]
+) -> list[bool]:
+    """Drop quaternion dims from the additive mask so they are handled multiplicatively."""
+    mask_list = list(mask)
+    quat_dims = {i for quad in quaternion_indices for i in quad}
+    if not quat_dims:
+        return mask_list
+    return [bool(m) and (i not in quat_dims) for i, m in enumerate(mask_list)]
+
+
+def to_relative_actions(
+    actions: Tensor,
+    state: Tensor,
+    mask: Sequence[bool],
+    quaternion_indices: Sequence[tuple[int, int, int, int]] | None = None,
+) -> Tensor:
+    """Convert absolute actions to relative for masked dims.
+
+    Position/scalar dims: ``relative = action - state``. Quaternion quadruplets (if
+    any): ``q_rel = q_action ⊗ q_state⁻¹``, canonicalized to qw >= 0 (short arc).
 
     Args:
         actions: (B, T, action_dim) or (B, action_dim).
         state: (B, state_dim). Broadcast across time dimension.
-        mask: Which dims to convert. Can be shorter than action_dim.
+        mask: Which dims to convert additively. Can be shorter than action_dim.
+        quaternion_indices: xyzw index quadruplets handled multiplicatively. These
+            dims are excluded from the additive path.
     """
-    mask_t = torch.tensor(mask, dtype=actions.dtype, device=actions.device)
-    dims = mask_t.shape[0]
+    quaternion_indices = list(quaternion_indices or [])
     # Align state to the same device/dtype as actions. _last_state is cached before
     # DeviceProcessorStep moves the transition, so it can be on CPU while actions are on CUDA.
     if state.device != actions.device or state.dtype != actions.dtype:
         state = state.to(device=actions.device, dtype=actions.dtype)
+
+    mask_t = torch.tensor(
+        _additive_mask(mask, quaternion_indices), dtype=actions.dtype, device=actions.device
+    )
+    dims = mask_t.shape[0]
     state_offset = state[..., :dims] * mask_t
     if actions.ndim == 3:
         state_offset = state_offset.unsqueeze(-2)
     actions = actions.clone()
     actions[..., :dims] -= state_offset
+
+    for quad in quaternion_indices:
+        idx = list(quad)
+        q_act = actions[..., idx]  # untouched by the additive step (masked out)
+        q_st = state[..., idx]
+        if q_act.ndim == 3 and q_st.ndim == 2:
+            q_st = q_st.unsqueeze(-2)
+        q_rel = quat_multiply(q_act, quat_conjugate(quat_normalize(q_st)))
+        actions[..., idx] = quat_canonicalize(quat_normalize(q_rel))
     return actions
 
 
-def to_absolute_actions(actions: Tensor, state: Tensor, mask: Sequence[bool]) -> Tensor:
-    """Convert relative actions back to absolute: absolute = relative + state (for masked dims).
+def to_absolute_actions(
+    actions: Tensor,
+    state: Tensor,
+    mask: Sequence[bool],
+    quaternion_indices: Sequence[tuple[int, int, int, int]] | None = None,
+) -> Tensor:
+    """Convert relative actions back to absolute for masked dims.
+
+    Position/scalar dims: ``absolute = relative + state``. Quaternion quadruplets (if
+    any): ``q_action = q_rel ⊗ q_state``, with the (possibly non-unit) predicted q_rel
+    normalized first and the result renormalized to a unit quaternion.
 
     Args:
         actions: (B, T, action_dim) or (B, action_dim).
         state: (B, state_dim). Broadcast across time dimension.
-        mask: Which dims to convert. Can be shorter than action_dim.
+        mask: Which dims to convert additively. Can be shorter than action_dim.
+        quaternion_indices: xyzw index quadruplets handled multiplicatively.
     """
-    mask_t = torch.tensor(mask, dtype=actions.dtype, device=actions.device)
-    dims = mask_t.shape[0]
+    quaternion_indices = list(quaternion_indices or [])
     # Align state to the same device/dtype as actions. _last_state is cached before
     # DeviceProcessorStep moves the transition, so it can be on CPU while actions are on CUDA.
     if state.device != actions.device or state.dtype != actions.dtype:
         state = state.to(device=actions.device, dtype=actions.dtype)
+
+    mask_t = torch.tensor(
+        _additive_mask(mask, quaternion_indices), dtype=actions.dtype, device=actions.device
+    )
+    dims = mask_t.shape[0]
     state_offset = state[..., :dims] * mask_t
     if actions.ndim == 3:
         state_offset = state_offset.unsqueeze(-2)
     actions = actions.clone()
     actions[..., :dims] += state_offset
+
+    for quad in quaternion_indices:
+        idx = list(quad)
+        q_rel = quat_normalize(actions[..., idx])  # model output is not exactly unit
+        q_st = state[..., idx]
+        if q_rel.ndim == 3 and q_st.ndim == 2:
+            q_st = q_st.unsqueeze(-2)
+        q_abs = quat_multiply(q_rel, quat_normalize(q_st))
+        actions[..., idx] = quat_normalize(q_abs)
     return actions
 
 
@@ -122,6 +220,12 @@ class RelativeActionsProcessorStep(ProcessorStep):
 
         return mask
 
+    def _quaternion_indices(self) -> list[tuple[int, int, int, int]]:
+        """xyzw quaternion column quadruplets inferred from action_names (cached)."""
+        if self.action_names is None:
+            return []
+        return detect_quaternion_indices_from_names(self.action_names)
+
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         observation = transition.get(TransitionKey.OBSERVATION, {})
         state = observation.get(OBS_STATE) if observation else None
@@ -139,7 +243,9 @@ class RelativeActionsProcessorStep(ProcessorStep):
             return new_transition
 
         mask = self._build_mask(action.shape[-1])
-        new_transition[TransitionKey.ACTION] = to_relative_actions(action, state, mask)
+        new_transition[TransitionKey.ACTION] = to_relative_actions(
+            action, state, mask, self._quaternion_indices()
+        )
         return new_transition
 
     def get_cached_state(self) -> torch.Tensor | None:
@@ -199,7 +305,9 @@ class AbsoluteActionsProcessorStep(ProcessorStep):
             return new_transition
 
         mask = self.relative_step._build_mask(action.shape[-1])
-        new_transition[TransitionKey.ACTION] = to_absolute_actions(action, cached_state, mask)
+        new_transition[TransitionKey.ACTION] = to_absolute_actions(
+            action, cached_state, mask, self.relative_step._quaternion_indices()
+        )
         return new_transition
 
     def get_config(self) -> dict[str, Any]:
