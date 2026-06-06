@@ -121,7 +121,20 @@ class G2Robot(Robot):
         # 激活阈值
         self.activation_threshold = 0.0001  # 位置激活阈值
         self.quaternion_threshold = 0.001  # 四元数激活阈值
-        self.joint_activation_threshold = 0.2  # 关节角度变化激活阈值（度）
+        self.joint_activation_threshold = 0.05  # 关节角度变化激活阈值（度）
+        self._pending_servo_motion_checks: dict[str, dict[str, Any]] = {}
+        self._servo_motion_check_delay_s = 0.5
+        self._servo_motion_check_timeout_s = 2.0
+        self._servo_motion_check_min_observed_delta_deg = 0.05
+        self._servo_motion_stall_log_interval_s = 1.0
+        self._servo_stall_recovery_sleep_s = 3
+        self._servo_stall_recovery_sleep_requested = False
+        self._no_servo_command_log_interval_s = 1.0
+        self._last_no_servo_command_log_s = 0.0
+        self._last_servo_motion_stall_log_s = {
+            "left": 0.0,
+            "right": 0.0,
+        }
         
     def _enabled_camera_names(self) -> list[str]:
         return list(self.selected_cameras.keys())
@@ -612,6 +625,7 @@ class G2Robot(Robot):
                 # 更新当前关节角度存储
                 if k in self._current_joint_positions:
                     self._current_joint_positions[k] = float(v)
+            self._check_pending_servo_motion()
 
         except Exception as e:
             logger.warning("获取关节状态失败: %s", e)
@@ -720,7 +734,7 @@ class G2Robot(Robot):
         return status.frame_poses
 
     def send_action(self, action: RobotAction) -> RobotAction:
-        """Send joint actions to robot via GDK joint control and gripper interfaces.
+        """Send joint actions to robot via GDK joint control.
         
         Action format includes joint positions (e.g., 'r.joint1.pos': -99.12) 
         and gripper positions (e.g., 'r.gripper.pos': 0.0).
@@ -741,10 +755,9 @@ class G2Robot(Robot):
         logger.debug(f"_get_joint_activation took {(t_activation_end - t_activation_start) * 1000:.2f} ms")
 
         try:
-            # Combined servo control: arm joints + G2 omnipicker grippers travel in one
-            # ``joint_servo_control`` request. ``_send_servo_control`` internally skips
-            # arms whose target equals the current position (per activation flags) and
-            # gripper joints with sub-threshold deltas.
+            # Arm joints and G2 omnipicker grippers are multiplexed into one
+            # ``joint_servo_control`` request. If a previous accepted arm command
+            # stalled, ``_send_servo_control`` performs one recovery sleep first.
             t_servo_start = time.perf_counter()
             self._send_servo_control(action, left_active, right_active)
             t_servo_end = time.perf_counter()
@@ -768,16 +781,24 @@ class G2Robot(Robot):
     def _send_servo_control(
         self, action: RobotAction, left_active: bool, right_active: bool
     ) -> None:
-        """Send arm joints + G2 omnipicker grippers via GDK ``joint_servo_control``.
+        """Send arm joints + G2 omnipicker grippers in one servo request.
 
         Arm joint positions in ``action`` are in degrees and converted to radians here.
-        G2 gripper positions are passed through (expected in radians, omnipicker range
-        [-0.785, 0]) and gated by ``GRIPPER_COMMAND_MIN_DELTA``. DH grippers are handled
-        separately via the existing serial-bus path.
+        G2 gripper positions are converted to the omnipicker radian range [-0.785, 0]
+        and gated by ``GRIPPER_COMMAND_MIN_DELTA``. DH grippers are handled separately
+        via the existing serial-bus path.
         """
         if not self._agibot_gdk or not self.robot:
             logger.warning("GDK not initialized, skipping servo control")
             return
+
+        if self._servo_stall_recovery_sleep_requested:
+            self._servo_stall_recovery_sleep_requested = False
+            logger.warning(
+                "servo_stall_recovery_sleep: sleeping %.3fs before next combined joint_servo_control",
+                self._servo_stall_recovery_sleep_s,
+            )
+            time.sleep(self._servo_stall_recovery_sleep_s)
 
         joint_names: list[str] = []
         joint_positions: list[float] = []
@@ -801,7 +822,9 @@ class G2Robot(Robot):
                 joint_names.append(gdk_name)
                 joint_positions.append(float(np.deg2rad(action[key])))
 
-        # G2 gripper joints — must travel in the same servo request as the arms.
+        # G2 gripper joints travel in the same servo request as the arms. Sending a
+        # gripper-only joint_servo_control packet has been observed to return success
+        # without moving the omnipicker, while combined arm+gripper packets can drive it.
         if self.config.use_gripper:
             gripper_config = self.config.gripper_config
             for arm in ("left", "right"):
@@ -815,21 +838,31 @@ class G2Robot(Robot):
 
                 # Action value is normalized [0, 1] (0 = open, 1 = closed) to stay
                 # consistent with the legacy move_ee_pos interface and fine-tuned
-                # policies. Convert to omnipicker joint radians here.
+                # policies. Convert to omnipicker joint radians on append.
                 value = float(action[key])
                 last = self._last_gripper_positions.get(arm)
                 if last is not None and abs(value - last) < GRIPPER_COMMAND_MIN_DELTA:
-                    # Hold last commanded position to avoid jitter near the deadband.
-                    value = float(last)
-                else:
-                    self._last_gripper_positions[arm] = value
-
+                    continue  # within deadband — do not include the gripper in this frame's packet
+                self._last_gripper_positions[arm] = value
                 joint_names.append(G2_GRIPPER_JOINT_NAMES[arm])
                 joint_positions.append(g2_gripper_normalized_to_rad(value))
 
         if not joint_names:
-            logger.debug("No joints to send via joint_servo_control")
+            self._log_no_servo_command_skipped(action, left_active, right_active)
             return
+
+        command_success = self._send_joint_servo_control_request(
+            joint_names, joint_positions, group="arm_gripper"
+        )
+        if command_success and arm_prefixes:
+            self._track_servo_motion_check(action, arm_prefixes)
+
+    def _send_joint_servo_control_request(
+        self, joint_names: list[str], joint_positions: list[float], group: str
+    ) -> bool:
+        """Send one joint_servo_control packet and return whether GDK accepted it."""
+        if not joint_names:
+            return False
 
         try:
             req = self._agibot_gdk.JointServoControlReq()
@@ -837,16 +870,201 @@ class G2Robot(Robot):
             req.joint_names = joint_names
             req.joint_positions = joint_positions
 
+            # Log what is actually sent to the robot. Arm joints are shown in degrees
+            # (converted from the SDK's radians), gripper joints are kept raw — the
+            # omnipicker uses its own rad range [-0.785, 0] which is more intuitive as-is.
+            _gripper_jnames = set(G2_GRIPPER_JOINT_NAMES.values())
+            logger.info(
+                "joint_servo_control -> group=%s %s",
+                group,
+                ", ".join(
+                    f"{n}={p:.4f}" if n in _gripper_jnames else f"{n}={np.rad2deg(p):.2f} deg"
+                    for n, p in zip(joint_names, joint_positions)
+                ),
+            )
+
             if self.config.servo_low_latency:
                 result = self.robot.joint_servo_control(req, enable_low_latency=True)
             else:
                 result = self.robot.joint_servo_control(req)
-            logger.debug(
-                f"joint_servo_control sent {len(joint_names)} joints "
-                f"(period={req.control_period:.3f}s), result: {result}"
-            )
+            if result != 0:
+                logger.error(
+                    "joint_servo_control group=%s sent %d joints failed"
+                    "(period=%.3fs), error code: %s",
+                    group,
+                    len(joint_names),
+                    req.control_period,
+                    result,
+                )
+                return False
+            else:
+                return True
         except Exception as e:
-            logger.error(f"joint_servo_control failed: {e}", exc_info=True)
+            logger.error("joint_servo_control group=%s failed: %s", group, e, exc_info=True)
+            return False
+
+    def _log_no_servo_command_skipped(
+        self, action: RobotAction, left_active: bool, right_active: bool
+    ) -> None:
+        """Log why a model/pipeline action produced no sendable servo command."""
+        now = time.perf_counter()
+        if now - self._last_no_servo_command_log_s < self._no_servo_command_log_interval_s:
+            return
+
+        def _max_arm_delta(prefix: str) -> float | None:
+            deltas = [
+                abs(float(action[key]) - float(self._current_joint_positions.get(key, 0.0)))
+                for i in range(1, 8)
+                if (key := f"{prefix}.joint{i}.pos") in action
+            ]
+            return max(deltas) if deltas else None
+
+        def _gripper_delta(arm: str, prefix: str) -> float | None:
+            key = f"{prefix}.gripper.pos"
+            if key not in action:
+                return None
+            last = self._last_gripper_positions.get(arm)
+            if last is None:
+                return None
+            return abs(float(action[key]) - float(last))
+
+        left_max_delta = _max_arm_delta("l")
+        right_max_delta = _max_arm_delta("r")
+        left_gripper_delta = _gripper_delta("left", "l")
+        right_gripper_delta = _gripper_delta("right", "r")
+
+        logger.info(
+            "servo_no_sendable_command: post-IK action had no joints beyond send thresholds; "
+            "this is not an execution-stall diagnostic | "
+            "left_active=%s right_active=%s left_joint_delta_max=%s deg right_joint_delta_max=%s deg "
+            "left_gripper_delta=%s right_gripper_delta=%s joint_threshold=%.3f deg "
+            "gripper_threshold=%.3f | if this is immediately preceded by EE target UNREACHABLE, "
+            "it is expected IK hold",
+            left_active,
+            right_active,
+            f"{left_max_delta:.3f}" if left_max_delta is not None else "n/a",
+            f"{right_max_delta:.3f}" if right_max_delta is not None else "n/a",
+            f"{left_gripper_delta:.4f}" if left_gripper_delta is not None else "n/a",
+            f"{right_gripper_delta:.4f}" if right_gripper_delta is not None else "n/a",
+            self.joint_activation_threshold,
+            GRIPPER_COMMAND_MIN_DELTA,
+        )
+        self._last_no_servo_command_log_s = now
+
+    def _track_servo_motion_check(self, action: RobotAction, arm_prefixes: list[str]) -> None:
+        """Track accepted arm servo commands so later observations can detect stalls."""
+        now = time.perf_counter()
+        for prefix in arm_prefixes:
+            arm = "left" if prefix == "l" else "right"
+            joint_keys = [f"{prefix}.joint{i}.pos" for i in range(1, 8) if f"{prefix}.joint{i}.pos" in action]
+            if not joint_keys:
+                continue
+
+            start_positions = {
+                key: float(self._current_joint_positions.get(key, 0.0)) for key in joint_keys
+            }
+            target_positions = {key: float(action[key]) for key in joint_keys}
+            max_target_delta = max(
+                abs(target_positions[key] - start_positions[key]) for key in joint_keys
+            )
+            if max_target_delta <= self.joint_activation_threshold:
+                continue
+
+            pending = self._pending_servo_motion_checks.get(arm)
+            if pending is None:
+                self._pending_servo_motion_checks[arm] = {
+                    "sent_time": now,
+                    "joint_keys": joint_keys,
+                    "start_positions": start_positions,
+                    "target_positions": target_positions,
+                    "max_target_delta_deg": max_target_delta,
+                }
+            else:
+                # Preserve the original start time and start positions so a continuous
+                # stream of accepted commands cannot hide a multi-frame no-motion stall.
+                pending["joint_keys"] = joint_keys
+                pending["target_positions"] = target_positions
+                pending["max_target_delta_deg"] = max(
+                    float(pending.get("max_target_delta_deg", 0.0)),
+                    max_target_delta,
+                )
+
+    def _check_pending_servo_motion(self) -> None:
+        """Log when a sent arm command is accepted by GDK but no joint motion appears."""
+        if not self._pending_servo_motion_checks:
+            return
+
+        now = time.perf_counter()
+        min_delay = max(
+            self._servo_motion_check_delay_s,
+            float(getattr(self.config, "servo_control_period", 0.0)) * 2.0,
+        )
+        completed: list[str] = []
+
+        for arm, pending in list(self._pending_servo_motion_checks.items()):
+            elapsed_s = now - float(pending["sent_time"])
+            joint_keys = list(pending["joint_keys"])
+            start_positions = pending["start_positions"]
+            target_positions = pending["target_positions"]
+            max_target_delta = float(pending["max_target_delta_deg"])
+
+            current_positions = {
+                key: float(self._current_joint_positions.get(key, start_positions[key]))
+                for key in joint_keys
+            }
+            observed_delta_by_key = {
+                key: abs(current_positions[key] - start_positions[key]) for key in joint_keys
+            }
+            remaining_delta_by_key = {
+                key: abs(target_positions[key] - current_positions[key]) for key in joint_keys
+            }
+            max_observed_delta = max(observed_delta_by_key.values())
+            max_remaining_delta = max(remaining_delta_by_key.values())
+            required_observed_delta = min(
+                self._servo_motion_check_min_observed_delta_deg,
+                max(max_target_delta * 0.25, self.joint_activation_threshold * 0.5),
+            )
+
+            if max_observed_delta >= required_observed_delta:
+                completed.append(arm)
+                continue
+            if max_remaining_delta <= self.joint_activation_threshold:
+                completed.append(arm)
+                continue
+            if elapsed_s < min_delay:
+                continue
+
+            last_log_s = self._last_servo_motion_stall_log_s.get(arm, 0.0)
+            if now - last_log_s >= self._servo_motion_stall_log_interval_s:
+                largest_key = max(joint_keys, key=lambda key: remaining_delta_by_key[key])
+                logger.warning(
+                    "non_unreachable_servo_stall: %s arm command accepted but observed joints did not move "
+                    "after %.3fs | target_delta_max=%.3f deg observed_delta_max=%.3f deg "
+                    "remaining_delta_max=%.3f deg largest_remaining=%s target=%.3f deg "
+                    "current=%.3f deg start=%.3f deg | this check only runs after an arm "
+                    "joint_servo_control command was sent, so IK-unreachable hold frames are excluded",
+                    arm,
+                    elapsed_s,
+                    max_target_delta,
+                    max_observed_delta,
+                    max_remaining_delta,
+                    largest_key,
+                    target_positions[largest_key],
+                    current_positions[largest_key],
+                    start_positions[largest_key],
+                )
+                self._last_servo_motion_stall_log_s[arm] = now
+                self._servo_stall_recovery_sleep_requested = True
+                logger.warning(
+                    "servo_stall_recovery_sleep_requested: next _send_servo_control will sleep %.3fs",
+                    self._servo_stall_recovery_sleep_s,
+                )
+
+            if elapsed_s >= self._servo_motion_check_timeout_s:
+                completed.append(arm)
+
+        for arm in completed:
+            self._pending_servo_motion_checks.pop(arm, None)
 
     def _get_joint_activation(self, action: RobotAction) -> tuple[bool, bool]:
         """Get activation status for joint control by comparing target and current positions.

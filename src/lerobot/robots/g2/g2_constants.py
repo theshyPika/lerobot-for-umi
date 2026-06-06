@@ -60,6 +60,19 @@ G2_GRIPPER_JOINT_NAMES = {
     "right": "idx71_gripper_r_inner_joint1",
 }
 
+# GDK ``move_ee_pos`` tool-group names for the G2 omnipicker grippers. Used when the
+# gripper is commanded via ``move_ee_pos(JointStates)`` instead of being multiplexed
+# onto the arm's ``joint_servo_control`` request.
+G2_GRIPPER_GROUP_NAMES = {
+    "left": "left_tool",
+    "right": "right_tool",
+}
+
+# GDK ``move_arm_joint_servo`` control-group selector for driving BOTH arms in one
+# call. The position vector for this group is 14 values in [left7, right7] order
+# (idx21..idx27 then idx61..idx67).
+ARM_SERVO_CONTROL_GROUP_DUAL = 2
+
 # Action/observation gripper convention for G2 (matches the legacy interface and
 # fine-tuned policy outputs): normalized value in [0, 1] where 0 = fully open
 # and 1 = fully closed. Mapped linearly to the omnipicker inner joint angle,

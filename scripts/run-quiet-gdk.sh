@@ -19,3 +19,4 @@ fi
 
 # 用 process substitution + grep --line-buffered, 保证子进程退出码能透传出来
 exec "$@" 2> >(grep --line-buffered -Ev "${PATTERN}" >&2)
+

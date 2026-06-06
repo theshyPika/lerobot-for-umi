@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 import traceback
 from threading import Event, Lock, Thread
@@ -314,14 +315,40 @@ class RTCInferenceEngine(InferenceEngine):
                                 prev_actions, target_steps=self._rtc_config.execution_horizon
                             )
 
+                        t_policy_start = time.perf_counter()
                         actions = self._policy.predict_action_chunk(
                             preprocessed, inference_delay=delay, prev_chunk_left_over=prev_actions
                         )
+                        t_policy_end = time.perf_counter()
 
                         original = actions.squeeze(0).clone()
                         processed = self._postprocessor(actions).squeeze(0)
                         new_latency = time.perf_counter() - current_time
                         new_delay = math.ceil(new_latency / time_per_chunk)
+                        logger.info(
+                            "policy_inference_timing: backend=rtc chunk=%d forward_ms=%.2f",
+                            inference_count,
+                            (t_policy_end - t_policy_start) * 1000.0,
+                        )
+
+                        # Optional: rotvec representation-flip diagnostic. Enable by exporting
+                        # ``LEROBOT_DIAG_RTC_ROTVEC=1`` (or =<layout>) before the rollout.
+                        # Compares rotvec adjacency distance against the true angular
+                        # distance for both raw policy output and post-processed chunk; flags
+                        # whether the "wild rotation" comes from the policy, the post-
+                        # processor, or simply from linear-in-rotvec interpolation.
+                        _diag_layout = os.environ.get("LEROBOT_DIAG_RTC_ROTVEC")
+                        if _diag_layout:
+                            try:
+                                from lerobot.exp.rotation_diag import log_chunk_diagnostics
+                                log_chunk_diagnostics(
+                                    original,
+                                    processed,
+                                    chunk_idx=inference_count,
+                                    layout=_diag_layout if _diag_layout not in ("1", "true", "True") else "dual_arm_with_gripper",
+                                )
+                            except Exception as e:
+                                logger.debug("ROTVEC_DIAG failed: %s", e)
 
                         inference_count += 1
                         consecutive_errors = 0
