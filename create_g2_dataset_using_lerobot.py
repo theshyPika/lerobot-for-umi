@@ -152,24 +152,32 @@ JOINT_NAMES = [
 ]
 LEFT_JOINT_NAMES = JOINT_NAMES[:8]
 RIGHT_JOINT_NAMES = JOINT_NAMES[8:]
+# EE pose actions/states store the orientation as a unit quaternion (xyzw) rather
+# than an axis-angle rotvec. Quaternions are a continuous double cover of SO(3) and
+# avoid the rotvec ‖r‖=π discontinuity that the G2's near-180° gripper working
+# orientations sit right next to (see docs/source/g2_dualarm_ik_fix.md and the
+# rotvec antipodal-twin investigation). Per arm: 3 position + 4 quaternion + 1
+# gripper = 8 dims; dual-arm = 16.
 EE_NAMES = [
     "l.ee.x",
     "l.ee.y",
     "l.ee.z",
-    "l.ee.wx",
-    "l.ee.wy",
-    "l.ee.wz",
+    "l.ee.qx",
+    "l.ee.qy",
+    "l.ee.qz",
+    "l.ee.qw",
     "l.ee.gripper.pos",
     "r.ee.x",
     "r.ee.y",
     "r.ee.z",
-    "r.ee.wx",
-    "r.ee.wy",
-    "r.ee.wz",
+    "r.ee.qx",
+    "r.ee.qy",
+    "r.ee.qz",
+    "r.ee.qw",
     "r.ee.gripper.pos",
 ]
-LEFT_EE_NAMES = EE_NAMES[:7]
-RIGHT_EE_NAMES = EE_NAMES[7:]
+LEFT_EE_NAMES = EE_NAMES[:8]
+RIGHT_EE_NAMES = EE_NAMES[8:]
 
 ARM_MODE_ALIASES = {
     "dual": "dual",
@@ -361,23 +369,43 @@ def load_episode_data(episode_path: Path) -> pd.DataFrame:
     return df
 
 
-def quaternion_to_axis_angle(quat_xyzw: np.ndarray) -> np.ndarray:
-    quat_xyzw = np.asarray(quat_xyzw, dtype=np.float64)
-    norm = np.linalg.norm(quat_xyzw)
+def normalize_quaternion_xyzw(quat_xyzw: np.ndarray, ref: np.ndarray | None = None) -> np.ndarray:
+    """Unit-normalize a xyzw quaternion and choose a sign-continuous representation.
+
+    A unit quaternion and its negation represent the same rotation. To keep the
+    stored EE-orientation trajectory continuous (no spurious ±q jumps when the
+    rotation crosses the 180° boundary), each frame's quaternion is sign-aligned
+    against the previous frame's quaternion ``ref`` via the dot-product test. The
+    first frame of a stream has no ``ref`` and is canonicalized to ``qw >= 0``.
+
+    NOTE: this is deliberately NOT per-frame ``qw >= 0`` canonicalization, which
+    would re-introduce a discontinuity at the 180° boundary (q jumps from
+    [≈u, 0+] to [≈-u, 0+]). Trajectory-continuous sign walks smoothly across it.
+    """
+    q = np.asarray(quat_xyzw, dtype=np.float64).reshape(-1)
+    norm = np.linalg.norm(q)
     if norm < 1e-8:
-        return np.zeros(3, dtype=np.float32)
-
-    q = quat_xyzw / norm
-    if q[3] < 0:
+        return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)  # identity
+    q = q / norm
+    if ref is not None:
+        if float(np.dot(q, np.asarray(ref, dtype=np.float64))) < 0.0:
+            q = -q
+    elif q[3] < 0.0:  # first frame of the stream: canonical qw >= 0
         q = -q
+    return q.astype(np.float32)
 
-    angle = 2.0 * np.arccos(np.clip(q[3], -1.0, 1.0))
-    sin_half = np.sqrt(max(1.0 - q[3] * q[3], 0.0))
-    if sin_half < 1e-8:
-        rotvec = 2.0 * q[:3]
-    else:
-        rotvec = angle * (q[:3] / sin_half)
-    return rotvec.astype(np.float32)
+
+def split_dual_ee_pose(vec: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Split a raw 14-dim ``.end.position`` into (l_pos3, l_quat4, r_pos3, r_quat4).
+
+    Raw layout from the source dataset is ``[lpos3, lquat4(xyzw), rpos3, rquat4(xyzw)]``.
+    """
+    vec = np.asarray(vec, dtype=np.float32).reshape(-1)
+    if vec.shape != (14,):
+        raise ValueError(
+            f".end.position must be length 14 (pos3 + quat4 per arm), got {vec.shape}"
+        )
+    return vec[:3], vec[3:7], vec[7:10], vec[10:14]
 
 
 def ensure_float32_vector(value: Any, expected_len: int, field_name: str) -> np.ndarray:
@@ -424,26 +452,38 @@ def select_arm_slice(vector: np.ndarray, arm_mode: str, per_arm_dim: int) -> np.
     return vector.astype(np.float32)
 
 
-def vector_to_dual_rotvec(vec: np.ndarray, field_name: str) -> np.ndarray:
-    vec = np.asarray(vec, dtype=np.float32).reshape(-1)
-    if vec.shape == (12,):
-        return vec.astype(np.float32)
-    if vec.shape == (14,):
-        left = np.concatenate([vec[:3], quaternion_to_axis_angle(vec[3:7])])
-        right = np.concatenate([vec[7:10], quaternion_to_axis_angle(vec[10:14])])
-        return np.concatenate([left, right]).astype(np.float32)
-    raise ValueError(f"{field_name} must be length 12 (rotvec) or 14 (quaternion), got {vec.shape}")
+def extract_ee_vector(
+    row: pd.Series,
+    prefix: str,
+    sign_state: dict[tuple[str, str], np.ndarray] | None = None,
+) -> np.ndarray:
+    """Extract a 16-dim dual-arm EE vector with quaternion orientation.
 
+    Layout: ``[l_pos3, l_quat4(xyzw), l_grip, r_pos3, r_quat4(xyzw), r_grip]``.
 
-def extract_ee_vector(row: pd.Series, prefix: str) -> np.ndarray:
+    ``sign_state`` carries the previous frame's quaternion per (prefix, arm) so the
+    orientation trajectory is kept sign-continuous across frames. Pass the same dict
+    through every frame of an episode; pass ``None`` for a stateless single-frame call.
+    """
     raw = get_first_present(row, [f"{prefix}.end.position"], f"{prefix} dual-arm EE pose")
-    ee_vec = vector_to_dual_rotvec(np.asarray(raw), f"{prefix}.end.position")
+    l_pos, l_quat, r_pos, r_quat = split_dual_ee_pose(np.asarray(raw))
+
+    l_ref = sign_state.get((prefix, "l")) if sign_state is not None else None
+    r_ref = sign_state.get((prefix, "r")) if sign_state is not None else None
+    l_quat = normalize_quaternion_xyzw(l_quat, l_ref)
+    r_quat = normalize_quaternion_xyzw(r_quat, r_ref)
+    if sign_state is not None:
+        sign_state[(prefix, "l")] = l_quat
+        sign_state[(prefix, "r")] = r_quat
+
     grippers = extract_gripper_pair(
         row,
         prefix,
         raw_scale=G2_GRIPPER_RAW_MAX if prefix == "observation.state" else None,
     )
-    return np.concatenate([ee_vec[:6], grippers[:1], ee_vec[6:12], grippers[1:2]]).astype(np.float32)
+    left = np.concatenate([l_pos, l_quat, grippers[:1]])   # 3 + 4 + 1 = 8
+    right = np.concatenate([r_pos, r_quat, grippers[1:2]])  # 8
+    return np.concatenate([left, right]).astype(np.float32)  # 16
 
 
 def to_uint8_image(array: np.ndarray, expected_shape: tuple[int, int, int], field_name: str) -> np.ndarray:
@@ -601,6 +641,7 @@ def build_frame(
     action_type: str,
     arm_mode: str,
     visuals: EpisodeVisualSource,
+    sign_state: dict[tuple[str, str], np.ndarray] | None = None,
 ) -> dict[str, Any]:
     frame: dict[str, Any] = {
         "task": task_text,
@@ -614,10 +655,14 @@ def build_frame(
         )
         frame["action"] = select_arm_slice(extract_joint_vector(row, "action"), arm_mode=arm_mode, per_arm_dim=8)
     elif action_type == "ee":
+        # per_arm_dim = 8: pos3 + quat4 + gripper1. ``sign_state`` keeps the
+        # quaternion orientation trajectory sign-continuous across frames.
         frame["observation.state"] = select_arm_slice(
-            extract_ee_vector(row, "observation.state"), arm_mode=arm_mode, per_arm_dim=7
+            extract_ee_vector(row, "observation.state", sign_state), arm_mode=arm_mode, per_arm_dim=8
         )
-        frame["action"] = select_arm_slice(extract_ee_vector(row, "action"), arm_mode=arm_mode, per_arm_dim=7)
+        frame["action"] = select_arm_slice(
+            extract_ee_vector(row, "action", sign_state), arm_mode=arm_mode, per_arm_dim=8
+        )
     else:
         raise ValueError(f"Unsupported action_type: {action_type}")
 
@@ -643,6 +688,9 @@ def process_episode_to_dataset(
     fps: int,
 ) -> None:
     visuals = EpisodeVisualSource.discover(episode_path, df, fps)
+    # Per-episode quaternion sign-continuity state, reset for each episode so the
+    # first frame anchors at qw >= 0 and subsequent frames track their predecessor.
+    sign_state: dict[tuple[str, str], np.ndarray] = {}
     try:
         for frame_index, (_, row) in enumerate(df.iterrows()):
             frame = build_frame(
@@ -652,6 +700,7 @@ def process_episode_to_dataset(
                 action_type=action_type,
                 arm_mode=arm_mode,
                 visuals=visuals,
+                sign_state=sign_state,
             )
             dataset.add_frame(frame)
         dataset.save_episode()
