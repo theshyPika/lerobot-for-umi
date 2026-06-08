@@ -776,11 +776,14 @@ def compute_relative_action_stats(
 
     stats = running_stats.get_statistics()
 
-    excluded_dims = int(len(relative_mask) - relative_mask.sum())
+    quat_dims = {i for quad in quaternion_indices for i in quad}
+    additive_dims = sum(1 for i, m in enumerate(relative_mask) if m and i not in quat_dims)
+    absolute_dims = sum(1 for m in relative_mask if not m)
     total_frames = len(valid_starts) * chunk_size
     logging.info(
         f"Relative action stats ({len(valid_starts)} chunks, {total_frames} frames): "
-        f"relative_dims={int(relative_mask.sum())}/{len(relative_mask)} (excluded={excluded_dims}), "
+        f"dims={len(relative_mask)} (additive={additive_dims}, "
+        f"quaternion={len(quat_dims)} in {len(quaternion_indices)} group(s), absolute={absolute_dims}), "
         f"mean={np.abs(stats['mean']).mean():.4f}, std={stats['std'].mean():.4f}, "
         f"q01={stats['q01'].mean():.4f}, q99={stats['q99'].mean():.4f}"
     )
