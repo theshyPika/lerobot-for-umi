@@ -55,6 +55,13 @@ class PI05Config(PreTrainedConfig):
     relative_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
     # Populated at runtime from dataset metadata by make_policy.
     action_feature_names: list[str] | None = None
+    # Keep EE-orientation quaternion dims (xyzw quadruplets detected from
+    # action_feature_names) at IDENTITY normalization for both state and action,
+    # instead of the per-component QUANTILES remap. Quaternions are unit-norm
+    # (already in [-1, 1]); the skewed quantile remap biases the relative-orientation
+    # prediction and integrates into slow drift on the idle arm. Applies to training
+    # and inference. Requires xyzw quadruplets in action_feature_names (l.ee.qx/...).
+    quaternion_identity_normalization: bool = False
 
     # Real-Time Chunking (RTC) configuration
     rtc_config: RTCConfig | None = None
