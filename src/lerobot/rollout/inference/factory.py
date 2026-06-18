@@ -92,6 +92,7 @@ def create_inference_engine(
     task: str,
     fps: float,
     device: str | None,
+    subtask: str | None = None,
     use_torch_compile: bool = False,
     compile_warmup_inferences: int = 2,
     shutdown_event: Event | None = None,
@@ -106,6 +107,7 @@ def create_inference_engine(
             dataset_features=dataset_features,
             ordered_action_keys=ordered_action_keys,
             task=task,
+            subtask=subtask,
             device=device,
             robot_type=robot_wrapper.robot_type,
         )
@@ -118,6 +120,7 @@ def create_inference_engine(
             rtc_config=config.rtc,
             hw_features=hw_features,
             task=task,
+            subtask=subtask,
             fps=fps,
             device=device,
             use_torch_compile=use_torch_compile,

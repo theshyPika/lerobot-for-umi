@@ -428,6 +428,7 @@ def build_rollout_context(
         dataset_features=dataset_features,
         ordered_action_keys=ordered_action_keys,
         task=task_str,
+        subtask=cfg.subtask,
         fps=cfg.fps,
         device=cfg.device,
         use_torch_compile=cfg.use_torch_compile,

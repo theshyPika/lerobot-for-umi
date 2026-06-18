@@ -102,6 +102,7 @@ class RTCInferenceEngine(InferenceEngine):
         task: str,
         fps: float,
         device: str | None,
+        subtask: str | None = None,
         use_torch_compile: bool = False,
         compile_warmup_inferences: int = 2,
         rtc_queue_threshold: int = 30,
@@ -114,6 +115,7 @@ class RTCInferenceEngine(InferenceEngine):
         self._rtc_config = rtc_config
         self._hw_features = hw_features
         self._task = task
+        self._subtask = subtask
         self._fps = fps
         self._device = device or "cpu"
         self._use_torch_compile = use_torch_compile
@@ -292,6 +294,11 @@ class RTCInferenceEngine(InferenceEngine):
                             obs_batch, policy_device, self._task, self._robot.robot_type
                         )
                         obs_batch["task"] = [self._task]
+                        # Match the training prompt ("Task: …, Subtask: …, State: …").
+                        # Without the Subtask field the prompt is OOD and the support
+                        # (left) arm drifts; see processor_pi05 prompt construction.
+                        if self._subtask:
+                            obs_batch["subtask"] = [self._subtask]
 
                         preprocessed = self._preprocessor(obs_batch)
 

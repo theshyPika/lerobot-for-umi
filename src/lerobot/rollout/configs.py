@@ -285,6 +285,11 @@ class RolloutConfig:
     interpolation_multiplier: int = 1
     device: str | None = None
     task: str = ""
+    # Optional subtask string injected into the policy prompt every tick. Training
+    # prompts pi05 with "Task: …, Subtask: …, State: …"; real-robot rollout otherwise
+    # sends no Subtask field (OOD prompt), which makes the support arm drift slowly.
+    # Set this to the relevant subtask to match the training prompt distribution.
+    subtask: str | None = None
     display_data: bool = False
     # Display data on a remote Rerun server
     display_ip: str | None = None

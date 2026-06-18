@@ -117,13 +117,13 @@ class G2Robot(Robot):
         }
         
         # 激活阈值
-        self.activation_threshold = 0.0001  # 位置激活阈值
-        self.quaternion_threshold = 0.001  # 四元数激活阈值
-        self.joint_activation_threshold = 0.05  # 关节角度变化激活阈值（度）
+        # self.activation_threshold = 0.0001  # 位置激活阈值
+        # self.quaternion_threshold = 0.001  # 四元数激活阈值
+        self.joint_activation_threshold = 0.1  # 关节角度变化激活阈值（度）
         self._pending_servo_motion_checks: dict[str, dict[str, Any]] = {}
         self._servo_motion_check_delay_s = 0.5
         self._servo_motion_check_timeout_s = 2.0
-        self._servo_motion_check_min_observed_delta_deg = 0.05
+        self._servo_motion_check_min_observed_delta_deg = 0.005
         self._servo_motion_stall_log_interval_s = 1.0
         self._servo_stall_recovery_sleep_s = 3
         self._servo_stall_recovery_sleep_requested = False

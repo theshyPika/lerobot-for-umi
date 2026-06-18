@@ -64,6 +64,7 @@ class SyncInferenceEngine(InferenceEngine):
         task: str,
         device: str | None,
         robot_type: str,
+        subtask: str | None = None,
     ) -> None:
         self._policy = policy
         self._preprocessor = preprocessor
@@ -71,6 +72,7 @@ class SyncInferenceEngine(InferenceEngine):
         self._dataset_features = dataset_features
         self._ordered_action_keys = ordered_action_keys
         self._task = task
+        self._subtask = subtask
         self._device = torch.device(device or "cpu")
         self._robot_type = robot_type
         logger.info(
@@ -111,6 +113,10 @@ class SyncInferenceEngine(InferenceEngine):
             observation = prepare_observation_for_inference(
                 observation, self._device, self._task, self._robot_type
             )
+            # Match the training prompt's Subtask field (see processor_pi05); omitting
+            # it is OOD and slowly drifts the support arm.
+            if self._subtask:
+                observation["subtask"] = self._subtask
             observation = self._preprocessor(observation)
             action = self._policy.select_action(observation)
             action = self._postprocessor(action)

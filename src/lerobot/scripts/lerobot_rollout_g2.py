@@ -274,6 +274,35 @@ ESC exits. ``--dataset.push_to_hub=false`` keeps the run local)::
             --display_data=true \
             > src/lerobot/exp/stop_and_move_clean_nostill_ep_fr_45k_group4_1debug8.log 2>&1 | tail -f src/lerobot/exp/stop_and_move_clean_nostill_ep_fr_45k_group4_1debug8.log
 
+    LEROBOT_DIAG_RTC_ROTVEC=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 scripts/run-quiet-gdk.sh lerobot-rollout-g2 \
+            --fps=15 \
+            --strategy.type=sentry_panic \
+            --strategy.reset_time_s=10 \
+            --strategy.upload_every_n_episodes=2 \
+            --return_to_initial_position=false \
+            --interpolation_multiplier=1 \
+            --policy.path=/home/ck/models/finetune_models/pi05_g2_dual_arm_g1_7_recomputed_stats_clean_nostill_ep_fr_quat/checkpoints/022500/pretrained_model \
+            --policy.chunk_size=50 \
+            --policy.n_action_steps=50 \
+            --policy.use_relative_actions=true \
+            --policy.relative_exclude_joints='["gripper"]' \
+            --inference.type=rtc \
+            --inference.rtc.execution_horizon=10 \
+            --inference.rtc.max_guidance_weight=10 \
+            --robot.type=g2 \
+            --robot.use_left_arm=true --robot.use_right_arm=true \
+            --robot.use_gripper=true \
+            --dataset.repo_id="luck4ck/rollout_pi05_clean_nostill_ep_fr_quat_22d5k_group4_1debug6" \
+            --dataset.root="/home/ck/.cache/huggingface/rollout_pi05_clean_nostill_ep_fr_quat_22d5k_group4_1debug6" \
+            --dataset.single_task="将多个轴承同轴堆叠成塔形" \
+            --subtask="拾取第一个轴承 <拾取>；将轴承放置在工作台中央作为底座 <放置>" \
+            --dataset.streaming_encoding=true \
+            --dataset.push_to_hub=false \
+            --duration=0 \
+            --rename_map="{\"observation.images.head_color\": \"observation.images.base_0_rgb\", \"observation.images.hand_left\": \"observation.images.left_wrist_0_rgb\", \"observation.images.hand_right\": \"observation.images.right_wrist_0_rgb\"}" \
+            --display_data=true \
+            2>&1 | tee src/lerobot/exp/logs/large_rotation_check_rollout_pi05_clean_nostill_ep_fr_quat_22d5k_group4_1debug6.log
+
         
 """ 
 
@@ -362,7 +391,8 @@ class RolloutConfigG2(RolloutConfig):
     use_relative_frame_task: bool = True
     # Local-z TCP offset (m) applied to each arm's end link.
     # ee_tcp_offset: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.007])
-    ee_tcp_offset: list[float] = field(default_factory=lambda: [0.0, -0.007, 0.0])
+    # ee_tcp_offset: list[float] = field(default_factory=lambda: [0.0, -0.007, 0.0])
+    ee_tcp_offset: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
     # Skip IK when the absolute EE target is already close to the current EE
     # observation. Prevents near-hold commands from being re-solved into a
     # different redundant joint posture.

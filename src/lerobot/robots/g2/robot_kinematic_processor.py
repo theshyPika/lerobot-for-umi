@@ -28,6 +28,9 @@ class ForwardKinematicsJointsToEEObservationG2(ObservationProcessorStep):
     """Replace SDK EE observations with FK poses from the configured kinematics reference frame."""
 
     kinematics: DualArmKinematics | None = None
+    # Per-arm last emitted xyzw quaternion, used to keep the EE-orientation
+    # observation sign-continuous (see _sign_continuous). Not an init arg.
+    _prev_quat: dict[str, np.ndarray] = field(default_factory=dict, init=False, repr=False)
 
     def observation(self, observation: RobotObservation) -> RobotObservation:
         observation = dict(observation)
@@ -52,6 +55,7 @@ class ForwardKinematicsJointsToEEObservationG2(ObservationProcessorStep):
         observation: RobotObservation,
     ) -> dict[str, float]:
         quat = Rotation.from_matrix(pose[:3, :3]).as_quat()  # xyzw
+        quat = self._sign_continuous(prefix, quat)
         result = {
             f"{prefix}.ee.x": float(pose[0, 3]),
             f"{prefix}.ee.y": float(pose[1, 3]),
@@ -67,6 +71,33 @@ class ForwardKinematicsJointsToEEObservationG2(ObservationProcessorStep):
         if joint_gripper_key in observation:
             result[f"{prefix}.ee.gripper.pos"] = float(observation[joint_gripper_key])
         return result
+
+    def _sign_continuous(self, prefix: str, quat: np.ndarray) -> np.ndarray:
+        """Pick the sign-continuous xyzw representative of a unit quaternion.
+
+        ``q`` and ``-q`` denote the same rotation, but ``Rotation.from_matrix().as_quat()``
+        picks the sign by the largest matrix element (Shepperd's method), so it flips
+        arbitrarily between frames whose orientations are nearly identical. The training
+        datasets store the EE orientation sign-continuously (first frame canonicalized to
+        ``qw >= 0``, every later frame aligned to the previous via ``dot(q, q_prev) >= 0``;
+        see create_g2_dataset_using_lerobot.normalize_quaternion_xyzw). Without the same
+        convention here the policy's observation.state quaternion flips sign at inference,
+        landing far outside the (sign-continuous, hence one-signed) normalization quantiles
+        and corrupting the state input. Mirror that convention exactly, per arm.
+        """
+        quat = np.asarray(quat, dtype=np.float64)
+        prev = self._prev_quat.get(prefix)
+        if prev is not None:
+            if float(np.dot(quat, prev)) < 0.0:
+                quat = -quat
+        elif quat[3] < 0.0:  # first frame of the stream: canonical qw >= 0
+            quat = -quat
+        self._prev_quat[prefix] = quat
+        return quat
+
+    def reset(self):
+        """Drop the per-arm sign-continuity anchor so a new episode re-anchors at qw >= 0."""
+        self._prev_quat = {}
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]

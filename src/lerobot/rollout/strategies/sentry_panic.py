@@ -205,6 +205,18 @@ class SentryPanicStrategy(SentryStrategy):
                             # a freshly hand-placed scene.
                             interpolator.reset()
                             engine.reset()
+                            # New-episode flavour only: re-anchor the robot-side
+                            # pipelines (FK quaternion sign-continuity anchor + IK
+                            # seed) so the next episode starts from a clean per-arm
+                            # anchor — mirroring how the training data anchors each
+                            # episode independently (frame-0 qw >= 0). A normal
+                            # pause/resume keeps the anchor: the pose is physically
+                            # continuous across the hold, so re-anchoring there could
+                            # flip the hemisphere mid-episode. Done before priming so
+                            # the primed obs already carries the re-anchored sign.
+                            if self._new_episode_pending:
+                                ctx.processors.robot_observation_processor.reset()
+                                ctx.processors.robot_action_processor.reset()
                             # Prime the engine with a fresh observation BEFORE
                             # resume so the RTC thread can't race the next main-
                             # loop tick: without this, it picks up the pre-pause
