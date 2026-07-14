@@ -54,7 +54,7 @@ Performance notes:
 Examples:
     # 1) Small smoke test: only export up to 2 episodes from G7.
     # Useful for validating schema, task/subtask fields, and visual loading.
-    python create_g2_dataset_using_lerobot.py \
+    python tools/create_g2_dataset_using_lerobot.py \
         --source-dir /data1/training_data/sourceFile \
         --output-dir /tmp/g2_exports \
         --groups G7 \
@@ -65,7 +65,7 @@ Examples:
 
     # 2) Standard full export in joint space, saving camera streams as videos.
     # Good default for full dataset generation.
-    python create_g2_dataset_using_lerobot.py \
+    python tools/create_g2_dataset_using_lerobot.py \
         --source-dir /data1/training_data/sourceFile \
         --output-dir /data1/training_data/lerobot_exports \
         --groups G1 G2 G3 G4 G5 G6 G7 \
@@ -76,7 +76,7 @@ Examples:
 
     # 3) Right-arm-only export in joint space.
     # Useful when the downstream policy should only model the right arm.
-    python create_g2_dataset_using_lerobot.py \
+    python tools/create_g2_dataset_using_lerobot.py \
         --source-dir /data1/training_data/sourceFile \
         --output-dir /data1/training_data/lerobot_exports \
         --groups G1 G2 \
@@ -86,7 +86,7 @@ Examples:
         --dataset-name g2_right_arm_g1_g2
 
     # 4) Left-arm-only export in end-effector space.
-    python create_g2_dataset_using_lerobot.py \
+    python tools/create_g2_dataset_using_lerobot.py \
         --source-dir /data1/training_data/sourceFile \
         --output-dir /data1/training_data/lerobot_exports \
         --groups G3 G4 \
@@ -97,7 +97,7 @@ Examples:
 
     # 5) Faster video export on machines with NVIDIA encoder support.
     # This speeds up output video encoding, but does not remove source decode cost.
-    python create_g2_dataset_using_lerobot.py \
+    python tools/create_g2_dataset_using_lerobot.py \
         --source-dir /data1/training_data/sourceFile \
         --output-dir /data1/training_data/lerobot_exports \
         --groups G1 G2 G3 G4 G5 G6 G7 \
@@ -126,7 +126,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.video_utils import (
@@ -967,7 +967,7 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   1. Smoke test, small output, easiest for validation:
-     python create_g2_dataset_using_lerobot.py \\
+     python tools/create_g2_dataset_using_lerobot.py \\
          --output-dir /tmp/g2_exports \\
          --groups G7 \\
          --max-episodes-per-group 2 \\
@@ -975,7 +975,7 @@ def main() -> None:
          --dataset-name g2_g7_smoke
 
   2. Full joint-space export with videos:
-     python create_g2_dataset_using_lerobot.py \\
+     python tools/create_g2_dataset_using_lerobot.py \\
          --output-dir /data1/training_data/lerobot_exports \\
          --groups G1 G2 G3 G4 G5 G6 G7 \\
          --arm-mode dual \\
@@ -984,7 +984,7 @@ def main() -> None:
          --dataset-name g2_merged
 
   3. Right-arm-only export:
-     python create_g2_dataset_using_lerobot.py \\
+     python tools/create_g2_dataset_using_lerobot.py \\
          --output-dir /data1/training_data/lerobot_exports \\
          --groups G7 \\
          --arm-mode right \\
@@ -993,7 +993,7 @@ def main() -> None:
          --dataset-name g2_right_arm_g7
 
   4. Faster video encoding on NVIDIA GPUs:
-     python create_g2_dataset_using_lerobot.py \\
+     python tools/create_g2_dataset_using_lerobot.py \\
          --output-dir /data1/training_data/lerobot_exports \\
          --groups G1 G2 G3 G4 G5 G6 G7 \\
          --arm-mode dual \\
