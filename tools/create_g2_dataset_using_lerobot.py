@@ -4,7 +4,7 @@
 Create a LeRobot v3.0 dataset from G2 teleoperation episodes.
 
 This script converts the raw G2 teleoperation data under
-`/data1/training_data/sourceFile` into a LeRobot v3.0 dataset suitable for
+`/data/origin_training_data/teleop/g2/mock_light_module/sourceFile` into a LeRobot v3.0 dataset suitable for
 training or fine-tuning VLA-style models.
 
 Input expectations:
@@ -30,9 +30,13 @@ Arm selection:
 
 Task-related fields:
 - `task` is derived from `metaInfo["taskDesc"]`, because `taskName` like
-  `G1-2` is not suitable as a semantic language instruction for VLA training.
-- `subtask_index` is written into the frame data.
-- `meta/subtasks.parquet` is generated from `metaInfo["taskStep"]`.
+  `T1-001-001` is an identifier rather than a semantic language instruction.
+- For the new collection format, `T1-001-001` means scene `T1`, collection
+  task `001`, and generalization setting `001`.  The group uses the collection
+  task identifier `T1-001`.
+- `task` is the natural language prompt from `taskDesc`. `subtask_index` and
+  `meta/subtasks.parquet` are derived from the complete `taskStep` list, with
+  step numbers removed and entries joined into one description.
 
 Storage behavior:
 - `--video-storage image`: images are written as image features and embedded
@@ -52,23 +56,23 @@ Performance notes:
   be larger.
 
 Examples:
-    # 1) Small smoke test: only export up to 2 episodes from G7.
+    # 1) Small smoke test: only export up to 2 episodes from task T1-001.
     # Useful for validating schema, task/subtask fields, and visual loading.
     python tools/create_g2_dataset_using_lerobot.py \
-        --source-dir /data1/training_data/sourceFile \
+        --source-dir /data/origin_training_data/teleop/g2/mock_light_module/sourceFile \
         --output-dir /tmp/g2_exports \
-        --groups G7 \
+        --groups T1-001 \
         --max-episodes-per-group 2 \
         --action-type ee \
         --video-storage video \
-        --dataset-name g2_g7_smoke
+        --dataset-name g2_t1_smoke
 
     # 2) Standard full export in joint space, saving camera streams as videos.
     # Good default for full dataset generation.
     python tools/create_g2_dataset_using_lerobot.py \
-        --source-dir /data1/training_data/sourceFile \
+        --source-dir /data/origin_training_data/teleop/g2/mock_light_module/sourceFile \
         --output-dir /data1/training_data/lerobot_exports \
-        --groups G1 G2 G3 G4 G5 G6 G7 \
+        --groups T1-001 T1-002 \
         --arm-mode dual \
         --action-type joint \
         --video-storage video \
@@ -77,9 +81,9 @@ Examples:
     # 3) Right-arm-only export in joint space.
     # Useful when the downstream policy should only model the right arm.
     python tools/create_g2_dataset_using_lerobot.py \
-        --source-dir /data1/training_data/sourceFile \
+        --source-dir /data/origin_training_data/teleop/g2/mock_light_module/sourceFile \
         --output-dir /data1/training_data/lerobot_exports \
-        --groups G1 G2 \
+        --groups T1-001 \
         --arm-mode right \
         --action-type joint \
         --video-storage video \
@@ -87,9 +91,9 @@ Examples:
 
     # 4) Left-arm-only export in end-effector space.
     python tools/create_g2_dataset_using_lerobot.py \
-        --source-dir /data1/training_data/sourceFile \
+        --source-dir /data/origin_training_data/teleop/g2/mock_light_module/sourceFile \
         --output-dir /data1/training_data/lerobot_exports \
-        --groups G3 G4 \
+        --groups T1-001 \
         --arm-mode left \
         --action-type ee \
         --video-storage video \
@@ -98,9 +102,9 @@ Examples:
     # 5) Faster video export on machines with NVIDIA encoder support.
     # This speeds up output video encoding, but does not remove source decode cost.
     python tools/create_g2_dataset_using_lerobot.py \
-        --source-dir /data1/training_data/sourceFile \
+        --source-dir /data/origin_training_data/teleop/g2/mock_light_module/sourceFile \
         --output-dir /data1/training_data/lerobot_exports \
-        --groups G1 G2 G3 G4 G5 G6 G7 \
+        --groups T1-001 T1-002 \
         --arm-mode dual \
         --action-type joint \
         --video-storage video \
@@ -139,6 +143,11 @@ from lerobot.datasets.video_utils import (
 
 FPS = 30
 G2_GRIPPER_RAW_MAX = 120.0
+DEFAULT_SOURCE_DIR = "/data/origin_training_data/teleop/g2/mock_light_module/sourceFile"
+TASK_NAME_PATTERN = re.compile(
+    r"^(?P<scene>T\d+)[\-\u2010-\u2015](?P<task>\d+)[\-\u2010-\u2015](?P<generalization>\d+)$",
+    re.IGNORECASE,
+)
 CAMERA_SPECS = {
     "hand_left_color": (1056, 1280, 3),
     "hand_right_color": (1056, 1280, 3),
@@ -279,6 +288,43 @@ def build_ee_features(storage: str, arm_mode: str) -> dict[str, dict[str, Any]]:
     }
 
 
+@dataclass(frozen=True)
+class CollectionTaskName:
+    """The three identifiers encoded by a new-format G2 task name."""
+
+    scene: str
+    task: str
+    generalization: str
+
+    @property
+    def collection_task_id(self) -> str:
+        return f"{self.scene}-{self.task}"
+
+
+def parse_collection_task_name(task_name: Any) -> CollectionTaskName:
+    """Parse ``T<scene>-<task>-<generalization>`` task names.
+
+    The source occasionally uses Unicode dash characters, so those are accepted
+    in addition to ASCII hyphens.
+    """
+    name = str(task_name).strip()
+    match = TASK_NAME_PATTERN.fullmatch(name)
+    if match is None:
+        raise ValueError(
+            f"Invalid taskName {name!r}; expected T<scene>-<task>-<generalization>, "
+            "for example T1-001-002"
+        )
+    return CollectionTaskName(
+        scene=match.group("scene").upper(),
+        task=match.group("task"),
+        generalization=match.group("generalization"),
+    )
+
+
+def get_task_group_name(task_name: Any) -> str:
+    return parse_collection_task_name(task_name).collection_task_id
+
+
 def find_task_folders(source_dir: Path) -> dict[str, list[Path]]:
     task_folders: dict[str, list[Path]] = {}
     for item in sorted(source_dir.iterdir()):
@@ -294,22 +340,21 @@ def find_task_folders(source_dir: Path) -> dict[str, list[Path]]:
         try:
             with open(episode_dirs[0] / "metaInfo.json", "r", encoding="utf-8") as f:
                 meta_info = json.load(f)
-            task_name = meta_info.get("taskName", "") or item.name
-            group_name = task_name.split("-")[0] if "-" in task_name else task_name
+            task_name = meta_info.get("taskName", "")
+            group_name = get_task_group_name(task_name)
             task_folders.setdefault(group_name, []).append(item)
         except Exception as exc:  # noqa: BLE001
             logging.warning("Could not determine task name for %s: %s", item, exc)
-            task_folders.setdefault(item.name, []).append(item)
     return task_folders
 
 
 def clean_step_text(step: str) -> str:
     step = step.strip()
-    step = re.sub(r"^\s*\d+\.\s*", "", step)
-    return step.strip()
+    return re.sub(r"^\s*\d+\.\s*", "", step).strip()
 
 
 def parse_task_step(raw_task_step: Any) -> list[str]:
+    """Decode the task-step JSON into clean, ordered natural language steps."""
     if raw_task_step is None:
         return []
 
@@ -322,22 +367,28 @@ def parse_task_step(raw_task_step: Any) -> list[str]:
 
     try:
         parsed = json.loads(raw_text)
-        if isinstance(parsed, list):
-            return [clean_step_text(str(step)) for step in parsed if str(step).strip()]
     except json.JSONDecodeError:
-        pass
+        return [clean_step_text(raw_text)]
 
+    if isinstance(parsed, list):
+        return [clean_step_text(str(step)) for step in parsed if str(step).strip()]
     return [clean_step_text(raw_text)]
 
 
 def make_subtask_text(meta_info: dict[str, Any]) -> str:
+    """Return the natural language description stored in subtasks.parquet.
+
+    A single string preserves the existing LeRobot ``subtask_index -> subtask``
+    mapping while retaining every ordered step from the source metadata.
+    """
     steps = parse_task_step(meta_info.get("taskStep"))
     if steps:
         return "；".join(steps)
+
     task_desc = str(meta_info.get("taskDesc", "")).strip()
     if task_desc:
         return task_desc
-    return str(meta_info.get("taskName", "unknown")).strip() or "unknown"
+    return str(meta_info.get("taskName", "")).strip() or "unknown"
 
 
 def make_task_text(meta_info: dict[str, Any]) -> str:
@@ -345,9 +396,7 @@ def make_task_text(meta_info: dict[str, Any]) -> str:
     if task_desc:
         return task_desc
     task_name = str(meta_info.get("taskName", "")).strip()
-    if task_name:
-        return task_name
-    return "unknown"
+    return parse_collection_task_name(task_name).collection_task_id
 
 
 def load_episode_data(episode_path: Path) -> pd.DataFrame:
@@ -714,17 +763,20 @@ def get_resume_state_path(dataset_path: Path) -> Path:
 
 def build_export_config(
     source_dir: Path,
-    groups: list[str],
+    groups: list[str] | None,
     arm_mode: str,
     action_type: str,
     video_storage: str,
     fps: int,
     vcodec: str,
     max_episodes_per_group: int | None,
+    streaming_encoding: bool,
+    encoder_queue_maxsize: int,
+    encoder_threads: int | None,
 ) -> dict[str, Any]:
-    return {
+    config = {
         "source_dir": str(source_dir.resolve()),
-        "groups": list(groups),
+        "groups": list(groups) if groups is not None else None,
         "arm_mode": arm_mode,
         "action_type": action_type,
         "video_storage": video_storage,
@@ -732,6 +784,12 @@ def build_export_config(
         "vcodec": vcodec,
         "max_episodes_per_group": max_episodes_per_group,
     }
+    # Omit default write settings so exports created before these options remain resumable.
+    if streaming_encoding:
+        config["streaming_encoding"] = True
+        config["encoder_queue_maxsize"] = encoder_queue_maxsize
+        config["encoder_threads"] = encoder_threads
+    return config
 
 
 def load_resume_state(state_path: Path) -> dict[str, Any]:
@@ -761,7 +819,7 @@ def save_resume_state(
 def create_g2_dataset(
     source_dir: Path,
     output_dir: Path,
-    groups: list[str],
+    groups: list[str] | None,
     arm_mode: str,
     action_type: str,
     dataset_name: str,
@@ -769,6 +827,9 @@ def create_g2_dataset(
     fps: int,
     vcodec: str,
     max_episodes_per_group: int | None,
+    streaming_encoding: bool,
+    encoder_queue_maxsize: int,
+    encoder_threads: int | None,
     resume: bool,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -778,8 +839,9 @@ def create_g2_dataset(
     task_folders = find_task_folders(source_dir)
     logging.info("Found %d task groups: %s", len(task_folders), list(task_folders.keys()))
 
-    selected_folders = {group: task_folders[group] for group in groups if group in task_folders}
-    missing_groups = [group for group in groups if group not in task_folders]
+    selected_groups = groups if groups is not None else sorted(task_folders)
+    selected_folders = {group: task_folders[group] for group in selected_groups if group in task_folders}
+    missing_groups = [group for group in selected_groups if group not in task_folders]
     for group in missing_groups:
         logging.warning("Group %s not found in task folders", group)
     if not selected_folders:
@@ -819,6 +881,9 @@ def create_g2_dataset(
         fps=fps,
         vcodec=vcodec,
         max_episodes_per_group=max_episodes_per_group,
+        streaming_encoding=streaming_encoding,
+        encoder_queue_maxsize=encoder_queue_maxsize,
+        encoder_threads=encoder_threads,
     )
 
     if resume:
@@ -850,6 +915,9 @@ def create_g2_dataset(
             repo_id=dataset_name,
             root=dataset_path,
             vcodec=vcodec,
+            streaming_encoding=streaming_encoding,
+            encoder_queue_maxsize=encoder_queue_maxsize,
+            encoder_threads=encoder_threads,
         )
         total_episodes = int(dataset.meta.total_episodes)
         total_frames = int(dataset.meta.total_frames)
@@ -866,7 +934,9 @@ def create_g2_dataset(
             robot_type="g2",
             use_videos=(video_storage == "video"),
             vcodec=vcodec,
-            streaming_encoding=False,
+            streaming_encoding=streaming_encoding,
+            encoder_queue_maxsize=encoder_queue_maxsize,
+            encoder_threads=encoder_threads,
             metadata_buffer_size=1,
         )
         save_resume_state(state_path, export_config, completed_episodes, subtask_to_index)
@@ -969,15 +1039,15 @@ def main() -> None:
   1. Smoke test, small output, easiest for validation:
      python tools/create_g2_dataset_using_lerobot.py \\
          --output-dir /tmp/g2_exports \\
-         --groups G7 \\
+         --groups T1-001 \\
          --max-episodes-per-group 2 \\
          --video-storage image \\
-         --dataset-name g2_g7_smoke
+         --dataset-name g2_t1_smoke
 
   2. Full joint-space export with videos:
      python tools/create_g2_dataset_using_lerobot.py \\
          --output-dir /data1/training_data/lerobot_exports \\
-         --groups G1 G2 G3 G4 G5 G6 G7 \\
+         --groups T1-001 T1-002 \\
          --arm-mode dual \\
          --action-type joint \\
          --video-storage video \\
@@ -986,7 +1056,7 @@ def main() -> None:
   3. Right-arm-only export:
      python tools/create_g2_dataset_using_lerobot.py \\
          --output-dir /data1/training_data/lerobot_exports \\
-         --groups G7 \\
+         --groups T1-001 \\
          --arm-mode right \\
          --action-type joint \\
          --video-storage image \\
@@ -995,7 +1065,7 @@ def main() -> None:
   4. Faster video encoding on NVIDIA GPUs:
      python tools/create_g2_dataset_using_lerobot.py \\
          --output-dir /data1/training_data/lerobot_exports \\
-         --groups G1 G2 G3 G4 G5 G6 G7 \\
+         --groups T1-001 T1-002 \\
          --arm-mode dual \\
          --video-storage video \\
          --vcodec h264_nvenc \\
@@ -1003,8 +1073,8 @@ def main() -> None:
 
 Notes:
   - task comes from metaInfo.taskDesc
-  - subtask_index is stored in frame data
-  - meta/subtasks.parquet is generated from metaInfo.taskStep
+  - T1-001-001 is grouped by collection task T1-001
+  - task uses taskDesc; subtasks.parquet uses the complete taskStep description
   - arm-mode controls whether state/action are exported as left-only, right-only, or dual-arm vectors
   - image mode is convenient for debugging; video mode is the normal full-export choice
 """,
@@ -1012,7 +1082,7 @@ Notes:
     parser.add_argument(
         "--source-dir",
         type=str,
-        default="/data1/training_data/sourceFile",
+        default=DEFAULT_SOURCE_DIR,
         help="Source directory containing raw G2 episodes",
     )
     parser.add_argument(
@@ -1024,8 +1094,8 @@ Notes:
     parser.add_argument(
         "--groups",
         nargs="+",
-        default=["G1", "G2", "G3", "G4", "G5", "G6", "G7"],
-        help="Task groups to include, for example: G1 G2 G7",
+        default=None,
+        help="Collection task groups to include, for example: T1-001 T1-002. Defaults to every discovered task.",
     )
     parser.add_argument(
         "--arm-mode",
@@ -1070,6 +1140,23 @@ Notes:
         help="Optional cap per group, useful for smoke tests and partial exports",
     )
     parser.add_argument(
+        "--streaming-encoding",
+        action="store_true",
+        help="Encode video frames while exporting instead of writing temporary PNG frames first.",
+    )
+    parser.add_argument(
+        "--encoder-queue-maxsize",
+        type=int,
+        default=30,
+        help="Maximum queued frames per camera when --streaming-encoding is enabled.",
+    )
+    parser.add_argument(
+        "--encoder-threads",
+        type=int,
+        default=None,
+        help="Optional ffmpeg encoder threads per camera when --streaming-encoding is enabled.",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Resume a previously interrupted export using the checkpoint state stored under meta/.",
@@ -1089,6 +1176,9 @@ Notes:
         fps=args.fps,
         vcodec=args.vcodec,
         max_episodes_per_group=args.max_episodes_per_group,
+        streaming_encoding=args.streaming_encoding,
+        encoder_queue_maxsize=args.encoder_queue_maxsize,
+        encoder_threads=args.encoder_threads,
         resume=args.resume,
     )
 

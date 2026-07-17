@@ -37,17 +37,17 @@ Mirror of ``lerobot_edit_dataset`` for the draccus ``@parser.wrap()`` style
 
 Examples:
     # Full quaternion (ee) dual-arm build, parallel over groups.
-    # NOTE: draccus uses underscores and JSON for list fields, e.g. --groups '["G7"]'.
+    # NOTE: draccus uses underscores and JSON for list fields, e.g. --groups '["T1-001"]'.
     lerobot-build-g2-dataset \\
-        --source_dir /data1/training_data/sourceFile \\
+        --source_dir /data/origin_training_data/teleop/g2/mock_light_module/sourceFile \\
         --output_base /data1/training_data/teleop/g2/build \\
-        --groups '["G1","G2","G3","G4","G5","G6","G7"]' \\
+        --groups '["T1-001","T1-002"]' \\
         --action_type ee --arm_mode dual --vcodec h264 \\
         --filter.enabled true \\
         --stats.relative_action true --stats.chunk_size 50 \\
         --stats.relative_exclude_joints '["gripper"]' --stats.num_workers 24 \\
         --parallel_groups 4 \\
-        --final_name g2_dual_arm_g1_7_quat
+        --final_name g2_mock_light_module_quat
 
     # Reproduce an experiment from a YAML config.
     lerobot-build-g2-dataset --config_path build_quat.yaml
@@ -60,6 +60,7 @@ Examples:
     lerobot-build-g2-dataset --stages '["merge","recompute_stats"]' ...
 """
 
+import json
 import logging
 import re
 import shutil
@@ -88,6 +89,10 @@ _OBSERVATION_PATTERN_DEFAULT = r"观察|<观察>"
 _OBSERVATION_MIN_RATIO = 1.0
 
 STAGE_ORDER = ["convert", "prune", "filter", "merge", "recompute_stats"]
+NEW_TASK_NAME_PATTERN = re.compile(
+    r"^(?P<scene>T\d+)[\-\u2010-\u2015](?P<task>\d+)[\-\u2010-\u2015](?P<generalization>\d+)$",
+    re.IGNORECASE,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -141,13 +146,12 @@ class StatsConfig:
 @dataclass
 class G2BuildConfig:
     # Raw G2 teleoperation source (task folders -> episode folders w/ metaInfo.json).
-    source_dir: str = "/data1/training_data/sourceFile"
+    source_dir: str = "/data/origin_training_data/teleop/g2/mock_light_module/sourceFile"
     # Root of the structured output tree (convert/prune/filter/merge/final live under here).
     output_base: str = ""
-    # Task groups to convert (one convert subprocess per group).
-    groups: list[str] = field(
-        default_factory=lambda: ["G1", "G2", "G3", "G4", "G5", "G6", "G7"]
-    )
+    # Collection task groups to convert (one subprocess per group). An empty
+    # list discovers T1-001-style groups from metaInfo.taskName.
+    groups: list[str] = field(default_factory=list)
     # Final dataset name (repo_id) — also names the merge/ and final/ dirs.
     final_name: str = ""
 
@@ -158,6 +162,9 @@ class G2BuildConfig:
     vcodec: str = "libsvtav1"
     fps: int = 30
     max_episodes_per_group: int | None = None
+    streaming_encoding: bool = False
+    encoder_queue_maxsize: int = 30
+    encoder_threads: int | None = None
 
     # --- stage sub-configs ---
     filter: FilterConfig = field(default_factory=FilterConfig)
@@ -219,6 +226,40 @@ def merge_out(cfg: G2BuildConfig) -> Path:
 
 def final_out(cfg: G2BuildConfig) -> Path:
     return Path(cfg.output_base) / "final" / cfg.final_name
+
+
+def _task_group_name(task_name: object) -> str:
+    """Map a new-format task name such as T1-001-002 to T1-001."""
+    name = str(task_name).strip()
+    match = NEW_TASK_NAME_PATTERN.fullmatch(name)
+    if match is None:
+        raise ValueError(
+            f"Invalid taskName {name!r}; expected T<scene>-<task>-<generalization>, "
+            "for example T1-001-002"
+        )
+    return f"{match.group('scene').upper()}-{match.group('task')}"
+
+
+def _discover_groups(source_dir: Path) -> list[str]:
+    """Discover one collection-task group per raw task directory."""
+    groups: set[str] = set()
+    for task_dir in sorted(source_dir.iterdir()):
+        if not task_dir.is_dir():
+            continue
+        episode_meta = next(
+            (child / "metaInfo.json" for child in sorted(task_dir.iterdir()) if (child / "metaInfo.json").is_file()),
+            None,
+        )
+        if episode_meta is None:
+            continue
+        try:
+            with episode_meta.open(encoding="utf-8") as f:
+                meta_info = json.load(f)
+            groups.add(_task_group_name(meta_info.get("taskName", "")))
+        except (OSError, json.JSONDecodeError, ValueError, AttributeError) as exc:
+            logging.warning("Could not read task metadata %s: %s", episode_meta, exc)
+            continue
+    return sorted(groups)
 
 
 def _validate(cfg: G2BuildConfig) -> None:
@@ -284,6 +325,10 @@ def _convert_cmd(cfg: G2BuildConfig, group: str, resume: bool) -> list[str]:
     ]
     if cfg.max_episodes_per_group is not None:
         cmd += ["--max-episodes-per-group", str(cfg.max_episodes_per_group)]
+    if cfg.streaming_encoding:
+        cmd += ["--streaming-encoding", "--encoder-queue-maxsize", str(cfg.encoder_queue_maxsize)]
+        if cfg.encoder_threads is not None:
+            cmd += ["--encoder-threads", str(cfg.encoder_threads)]
     # Only pass --resume to the convert script when an interrupted run already
     # exists on disk; a fresh run with --resume raises "dataset path does not exist".
     if resume:
@@ -582,6 +627,12 @@ def _stage_recompute_stats(cfg: G2BuildConfig) -> None:
 def build_g2_dataset(cfg: G2BuildConfig) -> None:
     _validate(cfg)
     init_logging()
+
+    if not cfg.groups:
+        cfg.groups = _discover_groups(Path(cfg.source_dir))
+        if not cfg.groups:
+            raise ValueError(f"No task groups discovered under {cfg.source_dir}")
+        logging.info("Discovered collection task groups: %s", cfg.groups)
 
     logging.info(
         "G2 build pipeline: output_base=%s final=%s groups=%s action=%s arm=%s parallel=%d",

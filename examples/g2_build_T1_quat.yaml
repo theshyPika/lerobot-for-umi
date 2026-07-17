@@ -1,33 +1,35 @@
-# Example: build a training-ready G2 dataset for groups G1-G7 in one command.
+# Example: build a training-ready G2 dataset for new-format collection task groups.
 #
 # Quaternion (ee) dual-arm end-effector representation, still-frame filtering on,
 # prune off (new data collection no longer records observation subtasks), and
 # relative-action statistics recomputation enabled.
 #
 # Usage:
-#   uv run lerobot-build-g2-dataset --config_path examples/g2_build_g1_g7_quat.yaml
+#   uv run lerobot-build-g2-dataset --config_path examples/g2_build_T1_quat.yaml
 #
 # Dry run (print the plan + subprocess commands, write nothing):
-#   uv run lerobot-build-g2-dataset --config_path examples/g2_build_g1_g7_quat.yaml --dry_run true
+#   uv run lerobot-build-g2-dataset --config_path examples/g2_build_T1_quat.yaml --dry_run true
 #
 # Resume after an interrupted run (finished stage units are skipped):
-#   uv run lerobot-build-g2-dataset --config_path examples/g2_build_g1_g7_quat.yaml
+#   uv run lerobot-build-g2-dataset --config_path examples/g2_build_T1_quat.yaml
 #
 # The final training-ready dataset lands at:
 #   {output_base}/final/{final_name}
 
 # --- I/O ---
-source_dir: /data1/training_data/sourceFile              # raw G2 teleop source (task folders -> episodes)
-output_base: /data1/training_data/teleop/g2/build        # structured output tree root
-groups: ["G1", "G2", "G3", "G4", "G5", "G6", "G7"]        # one convert subprocess per group
-final_name: g2_dual_arm_g1_7_quat                         # final dataset repo_id / dir name
+source_dir: /data/origin_training_data/teleop/g2/mock_light_module/sourceFile  # raw G2 teleop source
+output_base: /data/training_data/teleop/g2/build_mock_light_module_streaming  # structured output tree root
+groups: []                                                # auto-discover T1-001-style collection task groups
+final_name: g2_mock_light_module_quat_streaming           # final dataset repo_id / dir name
 
 # --- convert stage ---
 arm_mode: dual            # dual | left | right
 action_type: ee           # ee (quaternion pose) | joint
 video_storage: video      # video | image
-vcodec: h264              # output video codec (use h264_nvenc for NVIDIA GPU encoding)
+vcodec: h264              # NVENC is unavailable in the current runtime
 fps: 30
+streaming_encoding: true  # encode continuously; avoids writing every source frame as a temporary PNG
+encoder_queue_maxsize: 30
 # max_episodes_per_group: 2   # uncomment for a quick smoke test
 
 # --- still-frame filter stage (per group, parallel) ---
