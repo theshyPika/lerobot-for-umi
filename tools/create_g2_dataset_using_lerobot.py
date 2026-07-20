@@ -473,22 +473,15 @@ def get_first_present(row: pd.Series, keys: list[str], field_name: str, required
     return None
 
 
-def extract_gripper_pair(row: pd.Series, prefix: str, *, raw_scale: float | None = None) -> np.ndarray:
+def extract_gripper_pair(row: pd.Series, prefix: str) -> np.ndarray:
     raw = get_first_present(row, [f"{prefix}.effector.position"], f"{prefix} gripper pair")
-    grippers = ensure_float32_vector(raw, 2, f"{prefix}.effector.position")
-    if raw_scale is not None:
-        grippers = grippers / raw_scale
-    return np.clip(grippers, 0.0, 1.0).astype(np.float32)
+    return ensure_float32_vector(raw, 2, f"{prefix}.effector.position")
 
 
 def extract_joint_vector(row: pd.Series, prefix: str) -> np.ndarray:
     raw = get_first_present(row, [f"{prefix}.joint.position"], f"{prefix} dual-arm joint positions")
     joints = ensure_float32_vector(raw, 14, f"{prefix}.joint.position")
-    grippers = extract_gripper_pair(
-        row,
-        prefix,
-        raw_scale=G2_GRIPPER_RAW_MAX if prefix == "observation.state" else None,
-    )
+    grippers = extract_gripper_pair(row, prefix)
     return np.concatenate([joints[:7], grippers[:1], joints[7:14], grippers[1:2]]).astype(np.float32)
 
 
@@ -525,11 +518,7 @@ def extract_ee_vector(
         sign_state[(prefix, "l")] = l_quat
         sign_state[(prefix, "r")] = r_quat
 
-    grippers = extract_gripper_pair(
-        row,
-        prefix,
-        raw_scale=G2_GRIPPER_RAW_MAX if prefix == "observation.state" else None,
-    )
+    grippers = extract_gripper_pair(row, prefix)
     left = np.concatenate([l_pos, l_quat, grippers[:1]])   # 3 + 4 + 1 = 8
     right = np.concatenate([r_pos, r_quat, grippers[1:2]])  # 8
     return np.concatenate([left, right]).astype(np.float32)  # 16
