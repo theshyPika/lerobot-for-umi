@@ -76,6 +76,10 @@ class PI05Config(PreTrainedConfig):
 
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
 
+    # Include dataset subtasks in the action prompt when available. Disable this
+    # for datasets whose subtask annotations are missing or not training-ready.
+    use_subtask_prompt: bool = True
+
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.IDENTITY,

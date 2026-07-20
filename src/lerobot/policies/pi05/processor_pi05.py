@@ -60,6 +60,7 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
     max_state_dim: int = 32
     task_key: str = "task"
     subtask_key: str = "subtask"
+    use_subtask_prompt: bool = True
 
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         transition = transition.copy()
@@ -71,7 +72,12 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         tasks = complementary_data.get(self.task_key)
         if tasks is None:
             raise ValueError("No task found in complementary data")
-        subtasks = complementary_data.get(self.subtask_key)
+        subtasks = complementary_data.get(self.subtask_key) if self.use_subtask_prompt else None
+
+        if not self.use_subtask_prompt and self.subtask_key in complementary_data:
+            complementary_data = dict(complementary_data)
+            complementary_data.pop(self.subtask_key)
+            transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
 
         # TODO: check if this necessary
         state = deepcopy(state)
@@ -104,6 +110,9 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         # Normalize state to [-1, 1] range if needed (assuming it's already normalized by normalizer processor step!!)
         # Discretize into 256 bins (see openpi `PaligemmaTokenizer.tokenize()`)
         return transition
+
+    def get_config(self) -> dict[str, Any]:
+        return {"use_subtask_prompt": self.use_subtask_prompt}
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
@@ -176,7 +185,10 @@ def make_pi05_pre_post_processors(
             stats=dataset_stats,
             identity_dims=identity_dims,
         ),
-        Pi05PrepareStateTokenizerProcessorStep(max_state_dim=config.max_state_dim),
+        Pi05PrepareStateTokenizerProcessorStep(
+            max_state_dim=config.max_state_dim,
+            use_subtask_prompt=config.use_subtask_prompt,
+        ),
         TokenizerProcessorStep(
             tokenizer_name="google/paligemma-3b-pt-224",
             max_length=config.tokenizer_max_length,
