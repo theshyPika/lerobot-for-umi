@@ -96,12 +96,6 @@ class _NormalizationMixin:
     dtype: torch.dtype | None = None
     eps: float = 1e-8
     normalize_observation_keys: set[str] | None = None
-    # Per-feature dimension indices that must bypass normalization (pass through as-is),
-    # regardless of the feature's NormalizationMode. Keyed by feature key (e.g. ACTION,
-    # OBS_STATE). Used to keep unit-quaternion EE-orientation dims at IDENTITY while
-    # position/gripper dims still use QUANTILES — avoids the skewed per-component
-    # quantile remap that biases the relative-orientation prediction. JSON-serializable.
-    identity_dims: dict[str, list[int]] | None = None
 
     _tensor_stats: dict[str, dict[str, Tensor]] = field(default_factory=dict, init=False, repr=False)
     _stats_explicitly_provided: bool = field(default=False, init=False, repr=False)
@@ -246,8 +240,6 @@ class _NormalizationMixin:
         }
         if self.normalize_observation_keys is not None:
             config["normalize_observation_keys"] = sorted(self.normalize_observation_keys)
-        if self.identity_dims:
-            config["identity_dims"] = {k: list(v) for k, v in self.identity_dims.items()}
         return config
 
     def _normalize_observation(self, observation: RobotObservation, inverse: bool) -> dict[str, Tensor]:
@@ -287,24 +279,6 @@ class _NormalizationMixin:
         return processed_action
 
     def _apply_transform(
-        self, tensor: Tensor, key: str, feature_type: FeatureType, *, inverse: bool = False
-    ) -> Tensor:
-        """Apply (un)normalization, then restore any ``identity_dims`` to their raw value.
-
-        ``identity_dims[key]`` columns bypass normalization in both directions: those
-        dimensions are unit quaternions already in [-1, 1], and per-component quantile
-        scaling distorts them. Restoring them to the input value is correct for the
-        forward pass (out = raw) and for the inverse pass too — the forward left them
-        unchanged, so the incoming "normalized" value equals the raw value.
-        """
-        out = self._apply_transform_core(tensor, key, feature_type, inverse=inverse)
-        idxs = (self.identity_dims or {}).get(key)
-        if idxs and tensor.shape[-1] > max(idxs):
-            out = out.clone()
-            out[..., idxs] = tensor[..., idxs]
-        return out
-
-    def _apply_transform_core(
         self, tensor: Tensor, key: str, feature_type: FeatureType, *, inverse: bool = False
     ) -> Tensor:
         """

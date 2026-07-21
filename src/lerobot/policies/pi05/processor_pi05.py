@@ -38,10 +38,8 @@ from lerobot.processor import (
     policy_action_to_transition,
     transition_to_policy_action,
 )
-from lerobot.processor.relative_action_processor import detect_quaternion_indices_from_names
 from lerobot.types import EnvTransition, TransitionKey
 from lerobot.utils.constants import (
-    ACTION,
     OBS_STATE,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
@@ -162,16 +160,6 @@ def make_pi05_pre_post_processors(
         action_names=getattr(config, "action_feature_names", None),
     )
 
-    # Optionally keep EE-orientation quaternion dims at IDENTITY (bypass QUANTILES) for
-    # both state and action. Same xyzw dims for both since observation.state mirrors the
-    # action EE layout. Applied in normalizer + unnormalizer so training and inference match.
-    identity_dims: dict[str, list[int]] | None = None
-    if getattr(config, "quaternion_identity_normalization", False):
-        quads = detect_quaternion_indices_from_names(getattr(config, "action_feature_names", None))
-        dims = sorted({i for quad in quads for i in quad})
-        if dims:
-            identity_dims = {ACTION: dims, OBS_STATE: dims}
-
     # OpenPI order: raw → relative → normalize → model → unnormalize → absolute
     input_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map=rename_map or {}),
@@ -183,7 +171,6 @@ def make_pi05_pre_post_processors(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
-            identity_dims=identity_dims,
         ),
         Pi05PrepareStateTokenizerProcessorStep(
             max_state_dim=config.max_state_dim,
@@ -203,7 +190,6 @@ def make_pi05_pre_post_processors(
             features=config.output_features,
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
-            identity_dims=identity_dims,
         ),
         AbsoluteActionsProcessorStep(enabled=config.use_relative_actions, relative_step=relative_step),
         DeviceProcessorStep(device="cpu"),
