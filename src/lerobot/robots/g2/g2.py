@@ -17,13 +17,13 @@ from .config_gripper import DHGripper
 from .g2_constants import (
     ARM_JOINT_MAPPING,
     FULL_JOINT_POSITIONS_OBS_KEY,
+    G2_GRIPPER_CLOSED_RAD,
     G2_GRIPPER_JOINT_NAMES,
+    G2_GRIPPER_OPEN_RAD,
     GRIPPER_COMMAND_MIN_DELTA,
     LEFT_ARM_JOINT_NAMES,
     RAD_TO_DEG,
     RIGHT_ARM_JOINT_NAMES,
-    g2_gripper_normalized_to_rad,
-    g2_gripper_rad_to_normalized,
 )
 
 logger = logging.getLogger(__name__)
@@ -541,15 +541,13 @@ class G2Robot(Robot):
                     return None
                 g_type = cfg.get("type", "g2")
                 if g_type == "g2":
-                    # Read true omnipicker joint angle from SDK joint state and
-                    # convert back to normalized [0, 1] (0 = open, 1 = closed).
+                    # Return the raw omnipicker joint angle (rad, [-0.785, 0]) directly;
+                    # the dataset/training/deploy pipeline uses the rad convention.
                     gdk_name = G2_GRIPPER_JOINT_NAMES.get(arm)
                     if gdk_name and gdk_name in joint_positions_by_name:
-                        return float(
-                            g2_gripper_rad_to_normalized(joint_positions_by_name[gdk_name])
-                        )
+                        return float(joint_positions_by_name[gdk_name])
                     last = self._last_gripper_positions.get(arm)
-                    return float(last) if last is not None else 0.0
+                    return float(last) if last is not None else G2_GRIPPER_OPEN_RAD
                 if g_type == "dh":
                     try:
                         gripper = self.grippers.get(arm)
@@ -720,16 +718,14 @@ class G2Robot(Robot):
                 if key not in action:
                     continue
 
-                # Action value is normalized [0, 1] (0 = open, 1 = closed) to stay
-                # consistent with the legacy move_ee_pos interface and fine-tuned
-                # policies. Convert to omnipicker joint radians on append.
+                # Action value is already omnipicker servo rad [-0.785, 0]; pass through directly.
                 value = float(action[key])
                 last = self._last_gripper_positions.get(arm)
                 if last is not None and abs(value - last) < GRIPPER_COMMAND_MIN_DELTA:
                     continue  # within deadband — do not include the gripper in this frame's packet
                 self._last_gripper_positions[arm] = value
                 joint_names.append(G2_GRIPPER_JOINT_NAMES[arm])
-                joint_positions.append(g2_gripper_normalized_to_rad(value))
+                joint_positions.append(float(np.clip(value, G2_GRIPPER_OPEN_RAD, G2_GRIPPER_CLOSED_RAD)))
 
         if not joint_names:
             self._log_no_servo_command_skipped(action, left_active, right_active)
